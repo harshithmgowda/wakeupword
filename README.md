@@ -92,3 +92,4 @@ dfc5bc9395388b6b1371139b9e9a3fd12efd5883f0c40c32efb75809519530e6  models/tflite/
 - [android_changes.md](./android_changes.md) — AndroidManifest & Gradle configuration
 - [LICENSES_AND_DATA_PROVENANCE.md](./LICENSES_AND_DATA_PROVENANCE.md) — Clean training data provenance (Option B)
 - [environment_report.md](./environment_report.md) — GPU, CUDA, and environment audit
+
