@@ -14,11 +14,14 @@ Add the audio recording permissions inside the `<manifest>` tag:
     <!-- Required for real-time microphone capture -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
-    <!-- Optional: Required ONLY if running wake-word detection in the background on Android 9+ (API 28+) -->
+    <!-- System-level background listening & Google Assistant-like popup -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    
-    <!-- Required on Android 14+ (API 34+) for foreground services accessing microphone -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
         android:label="Nexaura"

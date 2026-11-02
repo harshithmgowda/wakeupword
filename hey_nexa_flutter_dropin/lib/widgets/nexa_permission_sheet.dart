@@ -19,7 +19,8 @@ class NexaPermissionSheet extends StatefulWidget {
 
     final micGranted = await Permission.microphone.isGranted;
     final overlayGranted = await FlutterForegroundTask.canDrawOverlays;
-    final batteryIgnored = await FlutterForegroundTask.isIgnoringBatteryOptimizations;
+    final batteryIgnored = (await FlutterForegroundTask.isIgnoringBatteryOptimizations) ||
+        (await Permission.ignoreBatteryOptimizations.isGranted);
 
     // Show if forced or if critical permissions are missing and not yet dismissed
     if (force || (!alreadyPrompted && (!micGranted || !overlayGranted || !batteryIgnored))) {
@@ -70,7 +71,8 @@ class _NexaPermissionSheetState extends State<NexaPermissionSheet>
   Future<void> _checkPermissions() async {
     final mic = await Permission.microphone.isGranted;
     final overlay = await FlutterForegroundTask.canDrawOverlays;
-    final battery = await FlutterForegroundTask.isIgnoringBatteryOptimizations;
+    final battery = (await FlutterForegroundTask.isIgnoringBatteryOptimizations) ||
+        (await Permission.ignoreBatteryOptimizations.isGranted);
     final notif = await Permission.notification.isGranted;
 
     if (mounted) {
@@ -175,7 +177,10 @@ class _NexaPermissionSheetState extends State<NexaPermissionSheet>
                   description: 'Required to hear "Hey Nexa" in real-time.',
                   isGranted: _micGranted,
                   onTap: () async {
-                    await Permission.microphone.request();
+                    final status = await Permission.microphone.request();
+                    if (status.isPermanentlyDenied) {
+                      await openAppSettings();
+                    }
                     await _checkPermissions();
                   },
                 ),
@@ -189,7 +194,14 @@ class _NexaPermissionSheetState extends State<NexaPermissionSheet>
                   isGranted: _overlayGranted,
                   actionText: 'Open Settings',
                   onTap: () async {
-                    await FlutterForegroundTask.openSystemAlertWindowSettings();
+                    bool opened = false;
+                    try {
+                      opened = await FlutterForegroundTask.openSystemAlertWindowSettings();
+                    } catch (_) {}
+                    if (!opened) {
+                      await openAppSettings();
+                    }
+                    await _checkPermissions();
                   },
                 ),
                 const SizedBox(height: 12),
@@ -202,7 +214,43 @@ class _NexaPermissionSheetState extends State<NexaPermissionSheet>
                   isGranted: _batteryIgnored,
                   actionText: 'Allow',
                   onTap: () async {
-                    await FlutterForegroundTask.requestIgnoreBatteryOptimization();
+                    bool granted = false;
+                    try {
+                      // Attempt 1: Standard Android direct prompt
+                      granted = await FlutterForegroundTask.requestIgnoreBatteryOptimization();
+                    } catch (_) {}
+
+                    if (!granted) {
+                      try {
+                        // Attempt 2: permission_handler request
+                        final status = await Permission.ignoreBatteryOptimizations.request();
+                        granted = status.isGranted;
+                      } catch (_) {}
+                    }
+
+                    if (!granted) {
+                      // Attempt 3: Open Battery Optimization Settings list
+                      try {
+                        granted = await FlutterForegroundTask.openIgnoreBatteryOptimizationSettings();
+                      } catch (_) {}
+                    }
+
+                    if (!granted) {
+                      // Attempt 4: Fallback to App Info page (User selects Battery -> Unrestricted)
+                      try {
+                        await openAppSettings();
+                      } catch (_) {}
+                    }
+
+                    if (context.mounted) {
+                      ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+                        const SnackBar(
+                          content: Text('Please select "Unrestricted" or "Don\'t optimize" for AURA in Battery settings.'),
+                          duration: Duration(seconds: 4),
+                        ),
+                      );
+                    }
+
                     await _checkPermissions();
                   },
                 ),
@@ -267,88 +315,96 @@ class _PermissionTile extends StatelessWidget {
     final textColor = isDark ? Colors.white : AuraTheme.textPrimary;
     final subtextColor = isDark ? const Color(0xFF94A3B8) : AuraTheme.textSecondary;
 
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-      decoration: BoxDecoration(
-        color: cardBg,
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: isGranted ? null : onTap,
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(
-          color: isGranted ? AuraTheme.accentEmerald.withValues(alpha: 0.4) : borderColor,
-          width: 1,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          decoration: BoxDecoration(
+            color: cardBg,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: isGranted ? AuraTheme.accentEmerald.withValues(alpha: 0.4) : borderColor,
+              width: 1,
+            ),
+          ),
+          child: Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: isGranted
+                      ? AuraTheme.accentEmerald.withValues(alpha: 0.15)
+                      : AuraTheme.accentCyan.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Icon(
+                  icon,
+                  size: 20,
+                  color: isGranted ? AuraTheme.accentEmerald : AuraTheme.accentCyan,
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                        color: textColor,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      description,
+                      style: TextStyle(fontSize: 11, color: subtextColor),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              if (isGranted)
+                const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.check_circle_rounded, color: AuraTheme.accentEmerald, size: 20),
+                    SizedBox(width: 4),
+                    Text(
+                      'Enabled',
+                      style: TextStyle(
+                        color: AuraTheme.accentEmerald,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                )
+              else
+                TextButton(
+                  onPressed: onTap,
+                  style: TextButton.styleFrom(
+                    backgroundColor: AuraTheme.accentCyan.withValues(alpha: 0.12),
+                    foregroundColor: AuraTheme.accentCyan,
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                    minimumSize: Size.zero,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  child: Text(
+                    actionText,
+                    style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+                  ),
+                ),
+            ],
+          ),
         ),
-      ),
-      child: Row(
-        children: [
-          Container(
-            padding: const EdgeInsets.all(8),
-            decoration: BoxDecoration(
-              color: isGranted
-                  ? AuraTheme.accentEmerald.withValues(alpha: 0.15)
-                  : AuraTheme.accentCyan.withValues(alpha: 0.1),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: Icon(
-              icon,
-              size: 20,
-              color: isGranted ? AuraTheme.accentEmerald : AuraTheme.accentCyan,
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  style: TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w600,
-                    color: textColor,
-                  ),
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  description,
-                  style: TextStyle(fontSize: 11, color: subtextColor),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(width: 8),
-          if (isGranted)
-            const Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(Icons.check_circle_rounded, color: AuraTheme.accentEmerald, size: 20),
-                SizedBox(width: 4),
-                Text(
-                  'Enabled',
-                  style: TextStyle(
-                    color: AuraTheme.accentEmerald,
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ],
-            )
-          else
-            TextButton(
-              onPressed: onTap,
-              style: TextButton.styleFrom(
-                backgroundColor: AuraTheme.accentCyan.withValues(alpha: 0.12),
-                foregroundColor: AuraTheme.accentCyan,
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                minimumSize: Size.zero,
-                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-              ),
-              child: Text(
-                actionText,
-                style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
-              ),
-            ),
-        ],
       ),
     );
   }
 }
+
