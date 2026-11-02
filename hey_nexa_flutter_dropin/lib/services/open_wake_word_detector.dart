@@ -22,11 +22,15 @@ class OpenWakeWordDetector implements WakeDetector {
   static const int chunkSize = 1280;
   final List<int> _byteBuffer = [];
   
-  // Detection calibration:
-  // 0.20 provides high sensitivity on smartphone microphones while maintaining >94% precision
-  static const double _detectionThreshold = 0.20;
+  // Multi-frame calibration to eliminate false activations:
+  // Random noise only spikes for a single 80ms frame.
+  // Genuine speech ("Hey Nexa") spans multiple consecutive frames.
+  static const double _consecutiveThreshold = 0.38;
+  static const double _highConfidenceThreshold = 0.70;
+  static const int _requiredConsecutiveHits = 2;
+  int _consecutiveHits = 0;
   DateTime? _lastTriggerTime;
-  static const Duration _cooldownDuration = Duration(milliseconds: 2000);
+  static const Duration _cooldownDuration = Duration(milliseconds: 3000);
 
   static Future<void> initForegroundTask() async {
     FlutterForegroundTask.init(
@@ -192,18 +196,30 @@ class OpenWakeWordDetector implements WakeDetector {
       final prob = OpenWakeWord.getProbability();
       final isActivated = OpenWakeWord.isActivated();
 
-      if (prob > 0.05 || isActivated) {
-        print('[OpenWakeWordDetector] Score: ${prob.toStringAsFixed(3)}, Activated: $isActivated');
+      if (prob >= _consecutiveThreshold) {
+        _consecutiveHits++;
+      } else if (prob < 0.25) {
+        _consecutiveHits = 0;
+      }
+
+      if (prob > 0.08 || isActivated) {
+        print('[OpenWakeWordDetector] Score: ${prob.toStringAsFixed(3)}, Hits: $_consecutiveHits, Activated: $isActivated');
       }
 
       final now = DateTime.now();
       final inCooldown = _lastTriggerTime != null &&
           now.difference(_lastTriggerTime!) < _cooldownDuration;
 
-      // Detection condition: either C++ engine triggered activation or score crossed threshold
-      if ((isActivated || prob >= _detectionThreshold) && !inCooldown) {
+      // Detection condition:
+      // Either C++ engine activated, OR high confidence single frame (>=0.70), OR 2 consecutive hits at >=0.38
+      final isConfident = isActivated ||
+          prob >= _highConfidenceThreshold ||
+          _consecutiveHits >= _requiredConsecutiveHits;
+
+      if (isConfident && !inCooldown) {
         _lastTriggerTime = now;
-        print('[OpenWakeWordDetector] *** "Hey Nexa" WAKE WORD DETECTED! *** (score: $prob)');
+        _consecutiveHits = 0;
+        print('[OpenWakeWordDetector] *** "Hey Nexa" WAKE WORD DETECTED! *** (score: ${prob.toStringAsFixed(3)})');
         
         // If app is in background or screen is off, wake the screen and bring app to front!
         if (Platform.isAndroid) {
