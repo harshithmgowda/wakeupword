@@ -1,0 +1,1 @@
+# wakeupword for nexaura 
