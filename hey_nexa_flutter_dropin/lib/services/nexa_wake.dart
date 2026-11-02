@@ -170,16 +170,18 @@ class NexaWake extends ChangeNotifier with WidgetsBindingObserver {
     await _listen();
   }
 
-  Future<void> dictate({bool fromBackground = false}) async {
+  Future<void> dictate({bool fromBackground = false, bool fromWakeWord = false}) async {
     await pause(); // Release the passive session before starting dictation.
     _suspended = false;
     _finishing = false;
     reviewing = false;
     _draft = '';
     _restart?.cancel();
-    if (!_foreground) {
-      // Allow Android OS 400ms to bring MainActivity window to foreground
-      await Future.delayed(const Duration(milliseconds: 400));
+    if (Platform.isAndroid && fromWakeWord) {
+      // Allow Android audio HAL time to completely release microphone hardware lock
+      // and let MainActivity gain audio focus before starting speech recognizer
+      final handoffDelay = fromBackground ? 450 : 250;
+      await Future.delayed(Duration(milliseconds: handoffDelay));
     }
     await start(direct: true, fromBackground: fromBackground);
   }
@@ -270,7 +272,7 @@ class NexaWake extends ChangeNotifier with WidgetsBindingObserver {
         await detector!.start(() {
           if (_disposed || _suspended || !enabled) return;
           final triggeredFromBackground = !_foreground;
-          unawaited(dictate(fromBackground: triggeredFromBackground));
+          unawaited(dictate(fromBackground: triggeredFromBackground, fromWakeWord: true));
         }, () {
           enabled = false;
           status =

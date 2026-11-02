@@ -22,15 +22,18 @@ class OpenWakeWordDetector implements WakeDetector {
   static const int chunkSize = 1280;
   final List<int> _byteBuffer = [];
   
-  // Multi-frame calibration to eliminate false activations:
-  // Random noise only spikes for a single 80ms frame.
-  // Genuine speech ("Hey Nexa") spans multiple consecutive frames.
-  static const double _consecutiveThreshold = 0.38;
-  static const double _highConfidenceThreshold = 0.70;
-  static const int _requiredConsecutiveHits = 2;
-  int _consecutiveHits = 0;
+  // Calibrated detection parameters:
+  static const double _detectionThreshold = 0.40;
+  static const double _highConfidenceThreshold = 0.52;
+  static const Duration _cooldownDuration = Duration(milliseconds: 2500);
+
+  // Warmup protection: ignore first 10 chunks (~800ms) to eliminate startup transients
+  int _chunksProcessed = 0;
+  static const int _warmupChunks = 10;
+
+  // Rolling score window for natural speech phrasing
+  final List<double> _recentScores = [];
   DateTime? _lastTriggerTime;
-  static const Duration _cooldownDuration = Duration(milliseconds: 3000);
 
   static Future<void> initForegroundTask() async {
     FlutterForegroundTask.init(
@@ -145,6 +148,8 @@ class OpenWakeWordDetector implements WakeDetector {
       }
 
       _active = true;
+      _chunksProcessed = 0;
+      _recentScores.clear();
       _byteBuffer.clear();
       print('[OpenWakeWordDetector] Microphone audio stream started (16kHz PCM16 Mono). Listening...');
 
@@ -192,35 +197,51 @@ class OpenWakeWordDetector implements WakeDetector {
 
       // Feed 80ms audio to openWakeWord C++ engine
       OpenWakeWord.processAudio(int16List);
-      
+      _chunksProcessed++;
+
+      // Discard initial warmup frames to avoid transient false triggers
+      if (_chunksProcessed <= _warmupChunks) {
+        OpenWakeWord.getProbability();
+        OpenWakeWord.isActivated();
+        continue;
+      }
+
       final prob = OpenWakeWord.getProbability();
       final isActivated = OpenWakeWord.isActivated();
 
-      if (prob >= _consecutiveThreshold) {
-        _consecutiveHits++;
-      } else if (prob < 0.25) {
-        _consecutiveHits = 0;
+      if (prob > 0.0) {
+        _recentScores.add(prob);
+        if (_recentScores.length > 8) {
+          _recentScores.removeAt(0);
+        }
       }
 
       if (prob > 0.08 || isActivated) {
-        print('[OpenWakeWordDetector] Score: ${prob.toStringAsFixed(3)}, Hits: $_consecutiveHits, Activated: $isActivated');
+        print('[OpenWakeWordDetector] Score: ${prob.toStringAsFixed(3)}, Activated: $isActivated, Recent: ${_recentScores.map((s) => s.toStringAsFixed(2)).toList()}');
       }
 
       final now = DateTime.now();
       final inCooldown = _lastTriggerTime != null &&
           now.difference(_lastTriggerTime!) < _cooldownDuration;
 
+      if (inCooldown) continue;
+
       // Detection condition:
-      // Either C++ engine activated, OR high confidence single frame (>=0.70), OR 2 consecutive hits at >=0.38
+      // 1. C++ engine activation
+      // 2. Strong single-frame score (>=0.52)
+      // 3. Sustained confidence (>=0.40)
+      // 4. Multiple hits in rolling window (>=2 frames with score >=0.35)
+      final hasWindowHits = _recentScores.where((s) => s >= 0.35).length >= 2;
       final isConfident = isActivated ||
           prob >= _highConfidenceThreshold ||
-          _consecutiveHits >= _requiredConsecutiveHits;
+          prob >= _detectionThreshold ||
+          hasWindowHits;
 
-      if (isConfident && !inCooldown) {
+      if (isConfident) {
         _lastTriggerTime = now;
-        _consecutiveHits = 0;
-        print('[OpenWakeWordDetector] *** "Hey Nexa" WAKE WORD DETECTED! *** (score: ${prob.toStringAsFixed(3)})');
-        
+        _recentScores.clear();
+        print('[OpenWakeWordDetector] *** "Hey Nexa" WAKE WORD DETECTED! *** (score: ${prob.toStringAsFixed(3)}, activated: $isActivated)');
+
         // If app is in background or screen is off, wake the screen and bring app to front!
         if (Platform.isAndroid) {
           try {

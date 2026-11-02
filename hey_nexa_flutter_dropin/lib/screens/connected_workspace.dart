@@ -1653,7 +1653,62 @@ class _ConnectedWorkspaceState extends State<ConnectedWorkspace>
           }),
           muted(
               'Company Gemini is the default. If it fails, only your own saved backup key can be used. Your key stays private to your account.'),
-        ])
+        ]),
+        card([
+          Row(
+            children: [
+              const Icon(Icons.mic_rounded, color: _violet, size: 24),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    title('Hey Nexa voice activation'),
+                    Text(
+                      wake.enabled
+                          ? 'Active · Listening for “Hey Nexa”'
+                          : 'Off · Voice activation paused',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: wake.enabled
+                            ? AuraTheme.accentEmerald
+                            : AuraTheme.textSecondary,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Switch(
+                value: wake.enabled,
+                onChanged: (val) async {
+                  if (val) {
+                    await secureSession.write(
+                        key: 'nexa_wake_enabled', value: 'true');
+                    wakeRemembered = true;
+                    await wake.start();
+                  } else {
+                    await secureSession.write(
+                        key: 'nexa_wake_enabled', value: 'false');
+                    wakeRemembered = false;
+                    await wake.stop();
+                  }
+                  if (mounted) setState(() {});
+                },
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          muted(
+              'Saying “Hey Nexa” wakes your assistant hands-free. Outside the app, it opens the Cosmic Assistant. Inside the app, it uses the workspace directly.'),
+          button('Configure permissions & battery settings', () async {
+            await NexaPermissionSheet.showIfRequired(context, force: true);
+            if (mounted && wakeRemembered && !wake.enabled) {
+              await wake.start();
+            }
+          }),
+          button('Preview Cosmic Assistant overlay', openCosmicNexaModal),
+        ]),
       ];
     }
     return [];
