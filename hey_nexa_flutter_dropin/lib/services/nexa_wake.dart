@@ -9,7 +9,7 @@ import 'package:speech_to_text/speech_to_text.dart';
 /// Passive wake monitoring is distinct from recording a command.
 class NexaWake extends ChangeNotifier with WidgetsBindingObserver {
   final void Function(String) onDraft;
-  final void Function({bool fromBackground}) onAwake;
+  final Function onAwake;
   final void Function(String)? onCommand;
   final WakeDetector? detector;
 
@@ -23,6 +23,22 @@ class NexaWake extends ChangeNotifier with WidgetsBindingObserver {
             (recognizer == null && Platform.isAndroid ? OpenWakeWordDetector() : null),
         speech = recognizer ?? SpeechToText() {
     WidgetsBinding.instance.addObserver(this);
+  }
+
+  void _triggerAwake({bool fromBackground = false}) {
+    if (onAwake is void Function({bool fromBackground})) {
+      (onAwake as void Function({bool fromBackground}))(fromBackground: fromBackground);
+    } else if (onAwake is void Function(bool)) {
+      (onAwake as void Function(bool))(fromBackground);
+    } else if (onAwake is VoidCallback) {
+      (onAwake as VoidCallback)();
+    } else {
+      try {
+        Function.apply(onAwake, [], {#fromBackground: fromBackground});
+      } catch (_) {
+        Function.apply(onAwake, []);
+      }
+    }
   }
 
   final SpeechToText speech;
@@ -57,7 +73,7 @@ class NexaWake extends ChangeNotifier with WidgetsBindingObserver {
     if (!_disposed) notifyListeners();
   }
 
-  Future<void> start({bool direct = false}) async {
+  Future<void> start({bool direct = false, bool fromBackground = false}) async {
     if (!direct) enabled = true;
     dictating = direct;
     _awaitingCommand = false;
@@ -150,11 +166,11 @@ class NexaWake extends ChangeNotifier with WidgetsBindingObserver {
     if (!found) _locale = null;
 
     if (_disposed) return;
-    if (direct) onAwake(fromBackground: false);
+    if (direct) _triggerAwake(fromBackground: fromBackground);
     await _listen();
   }
 
-  Future<void> dictate() async {
+  Future<void> dictate({bool fromBackground = false}) async {
     await pause(); // Release the passive session before starting dictation.
     _suspended = false;
     _finishing = false;
@@ -165,7 +181,7 @@ class NexaWake extends ChangeNotifier with WidgetsBindingObserver {
       // Allow Android OS 400ms to bring MainActivity window to foreground
       await Future.delayed(const Duration(milliseconds: 400));
     }
-    await start(direct: true);
+    await start(direct: true, fromBackground: fromBackground);
   }
 
   Future<void> finishDictation() async {
@@ -254,8 +270,7 @@ class NexaWake extends ChangeNotifier with WidgetsBindingObserver {
         await detector!.start(() {
           if (_disposed || _suspended || !enabled) return;
           final triggeredFromBackground = !_foreground;
-          onAwake(fromBackground: triggeredFromBackground);
-          unawaited(dictate());
+          unawaited(dictate(fromBackground: triggeredFromBackground));
         }, () {
           enabled = false;
           status =
@@ -302,7 +317,7 @@ class NexaWake extends ChangeNotifier with WidgetsBindingObserver {
                 // Passive listening: Ignore speech that does not contain the wake word.
                 return;
               }
-              onAwake(fromBackground: false);
+              _triggerAwake(fromBackground: false);
               _awaitingCommand = command.isEmpty;
               wakeInThisSession = true;
               dictating = true;
