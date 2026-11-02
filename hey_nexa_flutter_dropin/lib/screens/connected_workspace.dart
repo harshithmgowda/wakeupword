@@ -242,16 +242,10 @@ class _ConnectedWorkspaceState extends State<ConnectedWorkspace>
       onAwake: ({bool fromBackground = false}) {
         if (!mounted) return;
         setState(() => panel = 'Assistant');
-        if (fromBackground) {
-          // Said "Hey Nexa" without opening the app (from background / home screen):
-          // Open the Cosmic Gemini overlay!
-          Future.delayed(const Duration(milliseconds: 250), () {
-            if (mounted) unawaited(openCosmicNexaModal());
-          });
-        } else {
-          // Said "Hey Nexa" in opened mobile app:
-          // Use the in-app mobile UI directly!
-        }
+        // Always open the Google Gemini-style Cosmic Assistant overlay!
+        Future.delayed(const Duration(milliseconds: 200), () {
+          if (mounted) unawaited(openCosmicNexaModal());
+        });
       },
     );
     wake.addListener(() {

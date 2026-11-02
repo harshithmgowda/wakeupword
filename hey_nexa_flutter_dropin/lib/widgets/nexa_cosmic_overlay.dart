@@ -327,12 +327,11 @@ class _NexaCosmicOverlayState extends State<NexaCosmicOverlay>
                               ),
                               const SizedBox(width: 10),
 
-                              // Sound Waveform Bars (|||)
+                              // Sound Waveform Bars (|||) or Send Action
                               GestureDetector(
                                 onTap: () {
                                   if (draftText.isNotEmpty) {
                                     widget.onSend();
-                                    Navigator.of(context).pop();
                                   }
                                 },
                                 child: Container(
@@ -340,10 +339,26 @@ class _NexaCosmicOverlayState extends State<NexaCosmicOverlay>
                                     horizontal: 6,
                                     vertical: 8,
                                   ),
-                                  child: _GeminiWaveformBars(
-                                    isListening: isListening,
-                                    waveController: _waveController,
-                                  ),
+                                  child: draftText.isNotEmpty
+                                      ? Container(
+                                          width: 34,
+                                          height: 34,
+                                          decoration: const BoxDecoration(
+                                            shape: BoxShape.circle,
+                                            color: Color(0xFF6C5CE7),
+                                          ),
+                                          child: const Center(
+                                            child: Icon(
+                                              Icons.arrow_upward_rounded,
+                                              color: Colors.white,
+                                              size: 20,
+                                            ),
+                                          ),
+                                        )
+                                      : _GeminiWaveformBars(
+                                          isListening: isListening,
+                                          waveController: _waveController,
+                                        ),
                                 ),
                               ),
                             ],
