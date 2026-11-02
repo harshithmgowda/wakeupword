@@ -1,0 +1,76 @@
+diff --git a/openwakeword/data.py b/openwakeword/data.py
+index 7a95306..fc9114d 100755
+--- a/openwakeword/data.py
++++ b/openwakeword/data.py
+@@ -571,7 +571,10 @@ def augment_clips(
+             "RIR": 0.5
+         },
+         background_clip_paths: List[str] = [],
+-        RIR_paths: List[str] = []
++        RIR_paths: List[str] = [],
++        background_min_snr_db: float = -10.0,
++        background_max_snr_db: float = 15.0,
++        background_mode: str = "per_batch",
+         ):
+     """
+     Applies audio augmentations to the specified audio clips, returning a generator that applies
+@@ -642,9 +645,9 @@ def augment_clips(
+             torch_audiomentations.AddBackgroundNoise(
+                 p=augmentation_probabilities["AddBackgroundNoise"],
+                 background_paths=background_clip_paths,
+-                min_snr_in_db=-10,
+-                max_snr_in_db=15,
+-                mode="per_batch"
++                min_snr_in_db=background_min_snr_db,
++                max_snr_in_db=background_max_snr_db,
++                mode=background_mode
+             ),
+             torch_audiomentations.Gain(max_gain_in_db=0, p=augmentation_probabilities["Gain"]),
+         ])
+diff --git a/openwakeword/train.py b/openwakeword/train.py
+index 708cdb2..8392462 100755
+--- a/openwakeword/train.py
++++ b/openwakeword/train.py
+@@ -758,31 +758,38 @@ if __name__ == '__main__':
+         config["total_length"] = 32000
+ 
+     # Do Data Augmentation
++    aug_kwargs = {
++        "background_min_snr_db": config.get("background_min_snr_db", -10.0),
++        "background_max_snr_db": config.get("background_max_snr_db", 15.0),
++        "background_mode": config.get("background_mode", "per_batch"),
++    }
++    if config.get("augmentation_probabilities"):
++        aug_kwargs["augmentation_probabilities"] = config["augmentation_probabilities"]
+     if args.augment_clips is True:
+         if not os.path.exists(os.path.join(feature_save_dir, "positive_features_train.npy")) or args.overwrite is True:
+             positive_clips_train = [str(i) for i in Path(positive_train_output_dir).glob("*.wav")]*config["augmentation_rounds"]
+             positive_clips_train_generator = augment_clips(positive_clips_train, total_length=config["total_length"],
+                                                            batch_size=config["augmentation_batch_size"],
+                                                            background_clip_paths=background_paths,
+-                                                           RIR_paths=rir_paths)
++                                                           RIR_paths=rir_paths, **aug_kwargs)
+ 
+             positive_clips_test = [str(i) for i in Path(positive_test_output_dir).glob("*.wav")]*config["augmentation_rounds"]
+             positive_clips_test_generator = augment_clips(positive_clips_test, total_length=config["total_length"],
+                                                           batch_size=config["augmentation_batch_size"],
+                                                           background_clip_paths=background_paths,
+-                                                          RIR_paths=rir_paths)
++                                                          RIR_paths=rir_paths, **aug_kwargs)
+ 
+             negative_clips_train = [str(i) for i in Path(negative_train_output_dir).glob("*.wav")]*config["augmentation_rounds"]
+             negative_clips_train_generator = augment_clips(negative_clips_train, total_length=config["total_length"],
+                                                            batch_size=config["augmentation_batch_size"],
+                                                            background_clip_paths=background_paths,
+-                                                           RIR_paths=rir_paths)
++                                                           RIR_paths=rir_paths, **aug_kwargs)
+ 
+             negative_clips_test = [str(i) for i in Path(negative_test_output_dir).glob("*.wav")]*config["augmentation_rounds"]
+             negative_clips_test_generator = augment_clips(negative_clips_test, total_length=config["total_length"],
+                                                           batch_size=config["augmentation_batch_size"],
+                                                           background_clip_paths=background_paths,
+-                                                          RIR_paths=rir_paths)
++                                                          RIR_paths=rir_paths, **aug_kwargs)
+ 
+             # Compute features and save to disk via memmapped arrays
+             logging.info("#"*50 + "\nComputing openwakeword features for generated samples\n" + "#"*50)

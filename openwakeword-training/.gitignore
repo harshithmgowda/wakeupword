@@ -1,0 +1,49 @@
+# environments
+.venv/
+.venv-analysis/
+.venv-onnx2tf/
+__pycache__/
+.superpowers/
+
+# nested git clones (patched separately, see patches/)
+openwakeword/
+piper-sample-generator/
+
+# bulk data and artifacts
+downloads/
+audioset_16k/
+fma/
+# extra synthetic positive material and the Piper voices behind it (rebuild with
+# tools/data/gen_piper_onnx.py; the accent/Lombard producers that filled these
+# are on the experiments branch)
+piper_voices_es/
+positives_es/
+positives_lombard/
+tv_mix/
+tv_mix_speech/
+tv_mix_speech_eval/
+eval_media/
+mit_rirs/
+my_custom_model*/
+stock_models/
+logs/
+*.npy
+*.npz
+*.wav
+*.log
+*.out
+
+# Persisted embedding caches (embed_cache.py). Regenerable, ~0.4 GB for the
+# 24h FA corpus; the manifest.json inside would otherwise be tracked.
+.embed_cache/
+.embed_cache_v2/
+
+# perf_audit/ lives on the experiments branch, where the benchmark scripts and
+# their small JSON/MD results are tracked. The underscore-prefixed entries are
+# the bulky captured intermediates (embedding caches, dumped tensors, file
+# listings), ~400 MB, regenerable by re-running the benchmarks -- never tracked
+# on either branch, so the rule stays here.
+perf_audit/_*
+
+# scratch directories some tests create and reuse
+tests/_tmp_*/

@@ -1,0 +1,37 @@
+diff --git a/openwakeword/train.py b/openwakeword/train.py
+index ff8ac24..fd75e10 100755
+--- a/openwakeword/train.py
++++ b/openwakeword/train.py
+@@ -964,7 +964,31 @@ if __name__ == '__main__':
+     if config.get("augmentation_probabilities"):
+         aug_kwargs["augmentation_probabilities"] = config["augmentation_probabilities"]
+     if args.augment_clips is True:
+-        if not os.path.exists(os.path.join(feature_save_dir, "positive_features_train.npy")) or args.overwrite is True:
++        # This stage writes FOUR feature files, largest first. Gating it on just
++        # one of them (this used to check positive_features_train.npy alone)
++        # means an interrupted run that got past the first file is treated as
++        # complete forever: every later run logs "features already exist,
++        # skipping" and does nothing, and the three missing files only surface
++        # much later in the train stage as a FileNotFoundError on
++        # positive_features_test.npy. The memmaps are sized upfront, so a
++        # half-written file has the correct size and cannot be detected that way
++        # either -- requiring all four to be present is the weakest check that
++        # does not silently produce an undersized training set.
++        feature_files = [
++            os.path.join(feature_save_dir, name) for name in (
++                "positive_features_train.npy", "positive_features_test.npy",
++                "negative_features_train.npy", "negative_features_test.npy",
++            )
++        ]
++        missing = [f for f in feature_files if not os.path.exists(f)]
++        if missing and len(missing) < len(feature_files):
++            logging.warning(
++                f"Found an incomplete feature set ({len(missing)} of "
++                f"{len(feature_files)} files missing), which means an earlier "
++                f"augmentation run was interrupted. Regenerating all of them. "
++                f"Missing: {', '.join(os.path.basename(f) for f in missing)}"
++            )
++        if missing or args.overwrite is True:
+             positive_clips_train = [str(i) for i in Path(positive_train_output_dir).glob("*.wav")]*config["augmentation_rounds"]
+             positive_clips_train_generator = augment_clips(positive_clips_train, total_length=config["total_length"],
+                                                            batch_size=config["augmentation_batch_size"],

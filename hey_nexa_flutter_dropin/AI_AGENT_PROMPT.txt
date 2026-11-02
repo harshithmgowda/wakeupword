@@ -1,0 +1,36 @@
+================================================================================
+PROMPT TO COPY AND PASTE TO YOUR FLUTTER AI AGENT (Antigravity / Cursor / Claude)
+================================================================================
+
+You are a senior Flutter and Android audio engineer. I need you to integrate a custom offline wake-word detector for the phrase "Hey Nexa" into this Flutter application.
+
+### Context & Assets Already Provided:
+1. I have copied the trained openWakeWord model files into `assets/models/`:
+   - `assets/models/melspectrogram.onnx`
+   - `assets/models/embedding_model.onnx`
+   - `assets/models/hey_nexa.onnx`
+   (TFLite versions are also available in `assets/models/` if preferred).
+2. I have added the service implementation into `lib/services/nexa_wake_word_service.dart`.
+3. An optional interactive UI test screen is in `lib/screens/wake_word_demo.dart`.
+4. The wake word detection runs 100% locally and offline on-device using ONNX Runtime.
+
+### Your Objectives:
+1. **Audit `pubspec.yaml`**:
+   - Ensure `open_wake_word: ^0.2.0`, `record: ^5.1.2`, and `permission_handler: ^11.3.1` are in `dependencies`.
+   - Ensure `assets/models/melspectrogram.onnx`, `assets/models/embedding_model.onnx`, and `assets/models/hey_nexa.onnx` are declared under `flutter.assets`.
+2. **Audit Android configuration**:
+   - In `android/app/src/main/AndroidManifest.xml`, ensure `android.permission.RECORD_AUDIO` is declared.
+   - In `android/app/build.gradle`, verify `minSdkVersion` is at least 24, and add `aaptOptions { noCompress 'onnx' }` so that ONNX models are not zipped inside the APK.
+3. **Connect to My Existing Assistant Flow**:
+   - Locate where my application handles the voice assistant UI / conversation loop (e.g. floating button, modal sheet, or chat screen).
+   - Initialize `NexaWakeWordService` when the app starts or when voice mode is activated.
+   - When `onWakeWordDetected` fires:
+     a. Trigger the assistant (open assistant modal, play wake chime, or start listening).
+     b. **Enforce Mutual Exclusion**: Call `_wakeWordService.setAssistantActive(true)` so the microphone is released for Speech-to-Text (STT) and won't loop-trigger during TTS voice playback.
+     c. Once the assistant finishes speaking/responding, call `_wakeWordService.setAssistantActive(false)` to resume wake-word detection.
+4. **Error Handling & Permissions**:
+   - Handle microphone permission requests smoothly. If denied, show an appropriate snackbar/dialog.
+   - Ensure proper lifecycle cleanup (`dispose()`) when screens are closed or app goes to background if appropriate.
+
+Inspect my codebase, propose the exact file edits, and apply them.
+

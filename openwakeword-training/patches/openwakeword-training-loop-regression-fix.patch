@@ -1,0 +1,205 @@
+diff --git a/openwakeword/data.py b/openwakeword/data.py
+index 2938c5b..a5e227d 100755
+--- a/openwakeword/data.py
++++ b/openwakeword/data.py
+@@ -1118,20 +1118,33 @@ class mmap_batch_generator:
+                 X.append(x)
+                 y.extend(y_batch)
+ 
+-            # LOCAL PATCH: `stack=False` hands the per-class arrays back
+-            # unstacked so the caller can do the dtype widening on the GPU.
++            # `stack=False` hands the per-class arrays back unstacked so a caller
++            # can do the dtype widening on the GPU instead of inside the
++            # np.vstack below (train._assemble_batch is the one caller today).
+             #
+-            # np.vstack here is where the training loop was actually spending
+-            # its time. Of the 1264 rows in a v7 batch, 1152 come from float16
+-            # files (the ACAV100M 2000 h bank and media_negatives), so vstack
+-            # widens them to float32 on ONE CPU core before anything reaches
+-            # the device. Measured per step on this box, real arrays:
+-            #   A  np.vstack (CPU upcast) + .to(cuda)  -- as shipped   6.43 ms
+-            #   B  per-class .to(cuda) -> .float() -> torch.cat        0.66 ms
+-            #   C  B + pinned staging buffers                          0.71 ms
+-            # against 2.60 ms of fwd+bwd+opt on 102,849 parameters: the loop
+-            # was starved, not GPU-bound. (Do NOT add pinned memory -- C is
+-            # measurably slower than B.)
++            # CORRECTED 2026-07-30: an isolated micro-benchmark (below) said this
++            # was a win, and for one session train.py's __main__ ran with
++            # `stack=False` in production. It was wrong to extrapolate from.
++            # A batch of the PRODUCTION config (my_model_v7.yaml,
++            # 1024+50+128+50 = 1252 rows, not the 1264-row figure originally
++            # quoted here, which was actually a v9r-shaped batch) measured
++            # THROUGH the real Model.train_model loop is 1.23x SLOWER with
++            # stack=False than with stack=True (perf_audit/item7_continuous.py:
++            # 8.55 vs 10.54 ms/step). train.py's __main__ is back on
++            # `stack=True`; see _assemble_batch's docstring for the full story.
++            # `stack=False` is kept available and tested, not deleted.
++            #
++            # The isolated number that originally motivated this, still
++            # accurate for what it actually measured (batch ASSEMBLY alone,
++            # GPU otherwise idle, real arrays, per step):
++            #   A  np.vstack (CPU upcast) + .to(cuda)                    6.43 ms
++            #   B  per-class .to(cuda) -> .float() -> torch.cat          0.66 ms
++            #   C  B + pinned staging buffers                            0.71 ms
++            # against 2.60 ms of fwd+bwd+opt on 102,849 parameters. What that
++            # comparison leaves out -- and what made B lose in the real loop --
++            # is queueing against the previous step's still-draining CUDA work;
++            # see _assemble_batch's docstring. (Do NOT add pinned memory
++            # either way -- C is measurably slower than B in isolation too.)
+             #
+             # float16 -> float32 is an EXACT widening, so where it happens
+             # cannot change a bit; torch.equal on real batches confirms it.
+diff --git a/openwakeword/train.py b/openwakeword/train.py
+index 1590f33..ff8ac24 100755
+--- a/openwakeword/train.py
++++ b/openwakeword/train.py
+@@ -22,42 +22,68 @@ from openwakeword.utils import AudioFeatures
+ 
+ 
+ def _assemble_batch(x, device):
+-    """LOCAL PATCH: move a training batch to `device`, doing any dtype
+-    widening THERE rather than on one CPU core.
+-
+-    `mmap_batch_generator(stack=False)` yields the per-class arrays unstacked
+-    (as a list of tensors, once the DataLoader has converted them). 1152 of a
+-    v7 batch's 1264 rows come from float16 files -- the ACAV100M 2000 h bank
+-    and media_negatives -- and upstream's `np.vstack` widened all of them to
+-    float32 single-threaded before anything reached the GPU. Measured on this
+-    box, real v7 feature files, batch (1252, 16, 96), 400 steps after 40
+-    warm-up, both timers containing the identical mmap read:
+-
+-        A  np.vstack (CPU upcast) + .to(cuda)  -- as shipped   4.300 ms/step
+-        B  per-class .to(cuda) -> widen -> torch.cat           0.970 ms/step
+-                                                               4.43x
+-
+-    fwd+bwd+opt on the same 102,849-parameter model is 2.051 ms/step.
+-    (Pinned staging buffers were measured SLOWER than B and are deliberately
+-    not used.)
+-
+-    HONEST END-TO-END CAVEAT -- do not quote the 4.43x as a training-stage
+-    speedup. Measured on the real loop, 2000 steps, 3 repeats, best of each:
+-
+-        bare fwd/bwd/opt loop, prefetch OFF   8.43 -> 3.37 ms/step   2.50x
+-        bare fwd/bwd/opt loop, prefetch ON    4.32 -> 3.50 ms/step   1.24x
+-        through Model.train_model             8.63 -> 8.51 ms/step   1.01x
+-
+-    Two things absorb it. `prefetch_generator` (already present) runs the
+-    generator on a background thread, so the np.vstack was ALREADY overlapped
+-    with the GPU step. And `train_model` itself spends ~5 ms/step on its own
+-    bookkeeping -- `loss.detach().cpu().numpy()`, `self.recall(...).cpu()` and
+-    the per-step weight tensor each force a device synchronisation -- which
+-    dominates whatever the batch path costs. This change is kept because it is
+-    bit-identical, halves the host->device bytes (7.7 MB -> 4.1 MB per step),
+-    and becomes load-bearing the moment those per-step syncs are addressed;
+-    it is NOT kept on the strength of a training-stage wall-clock win, because
+-    there is not currently a measurable one.
++    """Move a training batch to `device`, doing any dtype widening THERE
++    rather than on one CPU core -- IF the caller hands it an unstacked
++    per-class list (`mmap_batch_generator(stack=False)`).
++
++    CORRECTED 2026-07-30, NOT CURRENTLY WIRED INTO PRODUCTION. This function
++    was written, and `train.py`'s `__main__` briefly called
++    `mmap_batch_generator(..., stack=False)`, on the strength of an isolated
++    micro-benchmark: with the GPU otherwise idle, real v9r-shaped feature
++    files, batch (1264, 16, 96), 400 steps after 40 warm-up, both timers
++    containing the identical mmap read:
++
++        A  np.vstack (CPU upcast) + .to(cuda)  -- upstream       6.43 ms/step
++        B  per-class .to(cuda) -> widen -> torch.cat             0.66 ms/step
++                                                                  4.43x (isolated)
++
++    That commit's own docstring already carried an "honest end-to-end caveat"
++    reporting a real Model.train_model run as roughly neutral (1.01x), but the
++    config behind that specific number was never pinned down or reproduced
++    from a saved script -- an independent measurement review flagged it as
++    inconsistent with the isolated 4.43x, and a same-day re-measurement on the
++    PRODUCTION config (my_model_v7.yaml's real batch_n_per_class: ACAV100M_sample
++    1024, adversarial_negative 50, media_negatives 128, positive 50 = 1252
++    rows; the real 17.28 GB ACAV100M memmap; the real media_negatives/positive/
++    adversarial_negative files) resolved it the other way: B is SLOWER than A
++    once it runs inside the real training loop, not faster.
++
++    Methodology: ONE continuous generator per variant (no restart between
++    measurement windows, so the ACAV100M page cache goes cold -> warm exactly
++    like a real 30,000-step run, which is 5.5 passes over the 5,625,000-row
++    file), through the real `Model.train_model` (fwd+bwd+opt, the high-loss
++    reselection, the per-step `.cpu()` syncs), 7000 steps (1.27 ACAV passes),
++    50-step untimed warmup, idle box (perf_audit/item7_continuous.py):
++
++        stack=True  (A, np.vstack)         8.55 ms/step overall (8.72 cold / 7.90 warm)
++        stack=False (B, this function)    10.54 ms/step overall (10.63 cold / 10.22 warm)
++        B / A = 1.23x SLOWER                          (1.22x cold / 1.29x warm)
++
++    A second, independent run (fresh generator per repeat, 5 repeats x 2000
++    steps, perf_audit/item7_verify.py) agreed in direction and rough
++    magnitude: B slower by 1.08x best-of / 1.11x mean-of.
++
++    Why the isolated micro-benchmark was misleading: it measured assembly
++    ALONE with nothing else queued on the GPU. Inside the real loop, B's four
++    separate small `.to(device)` calls (one per class) queue behind whatever
++    CUDA work the previous step's backward/optimiser/`.cpu()` syncs left in
++    flight, and that per-call overhead -- multiplied by 4 -- costs more than
++    the single CPU-side `np.vstack` it was meant to avoid. A single big
++    blocking H2D copy apparently pipelines better against that queue than four
++    small ones do, at this batch size and class count.
++
++    CONSEQUENCE: `train.py`'s `__main__` now calls `mmap_batch_generator(...)`
++    with `stack=True` again (upstream's np.vstack path). This function and
++    `stack=False` are KEPT, not deleted -- both remain proven bit-identical
++    (`tests/test_batch_assembly.py`) and this becomes load-bearing the moment
++    `train_model`'s own ~5 ms/step of device syncs (`loss.detach().cpu().numpy()`,
++    `self.recall(...).cpu()`, the per-step weight tensor) are addressed, which
++    would change which side of this comparison wins. A bounded attempt at a
++    per-DTYPE-group variant (2 transfers instead of 4 for v7's 2 dtypes x 4
++    classes) was not pursued: it reorders rows relative to labels unless the
++    label construction is changed too (v7's classes alternate float16/float32
++    in config order, so no two are adjacent), which is real complexity for an
++    unproven win -- see perf_audit/item7_grouped.py.
+ 
+     The result is bit-identical, and not by luck: the target dtype is computed
+     with the SAME promotion rule numpy applied (torch.promote_types folded over
+@@ -1069,10 +1095,19 @@ if __name__ == '__main__':
+             n_per_class=config["batch_n_per_class"],
+             data_transform_funcs=data_transforms,
+             label_transform_funcs=label_transforms,
+-            # LOCAL PATCH: hand the per-class arrays over unstacked so
+-            # _assemble_batch can do the float16 -> float32 widening on the GPU.
+-            # 6.43 ms -> 0.66 ms per step, bit-identical.
+-            stack=False
++            # LOCAL PATCH, CORRECTED 2026-07-30: this was `stack=False` (GPU-side
++            # float16 -> float32 widening via _assemble_batch), on the strength of
++            # an isolated batch-assembly micro-benchmark (4.43x with the GPU
++            # otherwise idle). Re-measured on the PRODUCTION config through the
++            # real Model.train_model loop (continuous generator, cold ACAV100M
++            # cache -> warm, exactly like a real run): stack=False is 1.23x
++            # SLOWER (8.55 -> 10.54 ms/step), not faster -- the four per-class
++            # .to(device) calls queue behind the previous step's still-draining
++            # CUDA work in a way the idle-GPU micro-benchmark never saw. Back to
++            # stack=True (upstream's np.vstack path). Full numbers and the
++            # measurement that overturned this are in _assemble_batch's
++            # docstring and perf_audit/item7_continuous.py in the outer repo.
++            stack=True
+         )
+ 
+         class IterDataset(torch.utils.data.IterableDataset):
+diff --git a/openwakeword/utils.py b/openwakeword/utils.py
+index fce1b20..83fb5b4 100644
+--- a/openwakeword/utils.py
++++ b/openwakeword/utils.py
+@@ -104,6 +104,16 @@ def select_feature_device():
+ #:     upstream batching   39.19 s / 39.47 s   (244.9 / 243.2 clips/s)
+ #:     buffered to 256     16.45 s / 16.19 s   (583.6 / 592.9 clips/s)   2.42x
+ #: (that figure also includes the soundfile clip loader in openwakeword/data.py)
++#:
++#: CORRECTED 2026-07-30: 9600 clips was a small slice (v7's real positive_train
++#: pool is 74,240) and overstated the multiplier. Re-measured at PRODUCTION
++#: SCALE -- 70,000 real clips, this same combined comparison (soundfile loader
++#: + this buffering together, "before" reconstructed by pointing `_load_audio`
++#: back at `torchaudio.load`), idle box, two full runs each:
++#:     before   241.22 s / 242.15 s   (290.2 / 289.1 clips/s)
++#:     after    114.88 s / 118.80 s   (609.3 / 589.2 clips/s)   2.04-2.10x, ~2.07x
++#: Still a real, substantial speedup -- just ~2.07x at scale, not 2.42x. See
++#: perf_audit/bench_augment_e2e_v2.py.
+ FEATURE_BATCH_SIZE = 256
+ 
+ 

@@ -1,0 +1,53 @@
+diff --git a/openwakeword/train.py b/openwakeword/train.py
+index 8392462..ed277e8 100755
+--- a/openwakeword/train.py
++++ b/openwakeword/train.py
+@@ -798,25 +798,44 @@ if __name__ == '__main__':
+                 n_cpus = 1
+             else:
+                 n_cpus = n_cpus//2
+-            compute_features_from_generator(positive_clips_train_generator, n_total=len(os.listdir(positive_train_output_dir)),
++            # LOCAL PATCH: n_total multiplied by augmentation_rounds. The four
++            # *_clips lists above are already `glob(...)*config["augmentation_rounds"]`,
++            # so each generator actually yields augmentation_rounds*N clips. Upstream
++            # passed the unmultiplied os.listdir() count as n_total, which
++            # compute_features_from_generator uses both to size the output memmap
++            # (open_memmap(..., shape=(n_total, ...))) and as its early-stop condition
++            # (`if row_counter >= n_total: break`). With augmentation_rounds > 1 that
++            # silently truncated every one of these four feature files back down to
++            # exactly one round's worth (verified: with augmentation_rounds=2 the
++            # positive_features_train.npy run stopped at precisely 71412 rows -- the
++            # tqdm total printed 71412//32 == 2231 batches -- discarding all of the
++            # second round's augmented clips instead of doubling the file as the v6
++            # config intends). Multiplying here keeps the memmap sized to what the
++            # generator actually produces.
++            aug_rounds = config["augmentation_rounds"]
++            compute_features_from_generator(positive_clips_train_generator,
++                                            n_total=len(os.listdir(positive_train_output_dir))*aug_rounds,
+                                             clip_duration=config["total_length"],
+                                             output_file=os.path.join(feature_save_dir, "positive_features_train.npy"),
+                                             device="gpu" if torch.cuda.is_available() else "cpu",
+                                             ncpu=n_cpus if not torch.cuda.is_available() else 1)
+ 
+-            compute_features_from_generator(negative_clips_train_generator, n_total=len(os.listdir(negative_train_output_dir)),
++            compute_features_from_generator(negative_clips_train_generator,
++                                            n_total=len(os.listdir(negative_train_output_dir))*aug_rounds,
+                                             clip_duration=config["total_length"],
+                                             output_file=os.path.join(feature_save_dir, "negative_features_train.npy"),
+                                             device="gpu" if torch.cuda.is_available() else "cpu",
+                                             ncpu=n_cpus if not torch.cuda.is_available() else 1)
+ 
+-            compute_features_from_generator(positive_clips_test_generator, n_total=len(os.listdir(positive_test_output_dir)),
++            compute_features_from_generator(positive_clips_test_generator,
++                                            n_total=len(os.listdir(positive_test_output_dir))*aug_rounds,
+                                             clip_duration=config["total_length"],
+                                             output_file=os.path.join(feature_save_dir, "positive_features_test.npy"),
+                                             device="gpu" if torch.cuda.is_available() else "cpu",
+                                             ncpu=n_cpus if not torch.cuda.is_available() else 1)
+ 
+-            compute_features_from_generator(negative_clips_test_generator, n_total=len(os.listdir(negative_test_output_dir)),
++            compute_features_from_generator(negative_clips_test_generator,
++                                            n_total=len(os.listdir(negative_test_output_dir))*aug_rounds,
+                                             clip_duration=config["total_length"],
+                                             output_file=os.path.join(feature_save_dir, "negative_features_test.npy"),
+                                             device="gpu" if torch.cuda.is_available() else "cpu",

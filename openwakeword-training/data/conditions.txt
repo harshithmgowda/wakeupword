@@ -1,0 +1,169 @@
+# Acoustic condition labels, inferred WITHOUT listening.
+# Columns: clip <TAB> label <TAB> confidence <TAB> basis
+#
+# The data root is now ~/openwakeword-train-data (this file predates the move
+# from ~/rec); the clips referenced below live under that root.
+#
+# HIGH confidence -- three independent measures agree; safe to act on.
+# LOW confidence  -- structural/statistical inference only; VERIFY BY EAR
+#                    before removing these from a training set.
+#
+# !!! SUPERSEDED IN PART -- CORRECTED BY EAR 2026-07-29 !!!
+# The user listened to all 22 clips in unused/excluded/music/
+# (speaker_a_29-40, speaker_b_31-40). That listening pass is ground truth and
+# overrides everything below:
+#   * ALL 22 are the wake word spoken over MUSIC. There are no far-field
+#     clips among them -- the "far" block below is WRONG for 11 clips.
+#   * speaker_b_34..speaker_b_40 (7 clips) are the ADVERSE subset: the music is
+#     LOUDER than the wake word (still audible to a human listener).
+#   * speaker_a_36, left unlabelled below, is music.
+# Authoritative labels: real_music_ground_truth.tsv (in this repo).
+# The whisper block below is NOT affected and still stands (HIGH confidence).
+# Corrected labels are also repeated in the CORRECTED block at the end of
+# this file so that tooling parsing this format picks them up; the original
+# inferred blocks are kept verbatim as a methodology record, and the
+# post-mortem at the bottom explains why the inference went wrong.
+
+# ---------------------------------------------------------------- whisper
+# voiced_frac collapses to ~0 against a speaker baseline of 0.86-0.96 (no
+# vocal-fold vibration), RMS 3-5x below the speaker's normal clips, and
+# YAMNet's Speech logit drops from ~+1 to ~-14.
+speaker_b_26	whisper	HIGH	voiced=0.000 rms=0.0037
+speaker_b_27	whisper	HIGH	voiced=0.034 rms=0.0038
+speaker_b_28	whisper	HIGH	voiced=0.000 rms=0.0044
+speaker_b_29	whisper	HIGH	voiced=0.000 rms=0.0057
+speaker_b_30	whisper	HIGH	voiced=0.000 rms=0.0055
+speaker_a_12	whisper	HIGH	voiced=0.125 rms=0.0084
+speaker_a_13	whisper	HIGH	voiced=0.039 rms=0.0054
+speaker_a_19	whisper	HIGH	voiced=0.000 rms=0.0109
+speaker_a_20	whisper	HIGH	voiced=0.000 rms=0.0085
+
+# Expected 5 whispers per speaker but only 4 are defensible for speaker_a.
+# speaker_a_36 / speaker_a_31 have the next-lowest voicing (0.195 / 0.199) but are LOUD
+# (rms 0.056 / 0.065) -- whispering is quiet, so these look like something
+# else. speaker_a's 5th whisper is unidentified.
+# [2026-07-29] RESOLVED BY EAR: speaker_a_36 and speaker_a_31 are both MUSIC clips --
+# loud, with voicing partly masked by the music. That is why they looked
+# "like something else." speaker_a has 4 whispers, not 5.
+
+# ------------------------------------------------------------------ music
+# --- ORIGINAL INFERENCE, kept for the record. These 10 labels happened to
+# --- be CORRECT (confirmed by ear 2026-07-29), but the reasoning below did
+# --- not entitle anyone to believe them, and the same reasoning produced 11
+# --- wrong labels in the "far" block. speaker_b_36-40 are additionally in the
+# --- verified music-LOUDER-than-speech subset; see the CORRECTED block.
+# LOW confidence. YAMNet detects real music reliably (+2.2 to +4.9 on FMA
+# clips) but FAILED on speech-dominant mixtures -- mixing music under speech
+# moved its Music logit the wrong way. These labels therefore rest only on
+# background-spectrum clustering and energy floor, which cannot separate
+# "music playing" from "different room". VERIFY BY EAR.
+speaker_b_36	music?	LOW	most background-distinct from normal; floor 0.41
+speaker_b_37	music?	LOW	floor 0.43
+speaker_b_38	music?	LOW	floor 0.41
+speaker_b_39	music?	LOW	floor 0.53
+speaker_b_40	music?	LOW	floor 0.48
+speaker_a_29	music?	LOW	tight background cluster (r=0.93-0.97) of exactly 5
+speaker_a_30	music?	LOW	same cluster
+speaker_a_31	music?	LOW	same cluster
+speaker_a_32	music?	LOW	same cluster
+speaker_a_33	music?	LOW	same cluster
+
+# -------------------------------------------------------------------- far
+# --- ORIGINAL INFERENCE, kept for the record. ALL 11 LABELS BELOW ARE WRONG:
+# --- every one of these clips is the wake word over MUSIC (verified by ear
+# --- 2026-07-29, see real_music_ground_truth.tsv). speaker_b_34/speaker_b_35 are in
+# --- fact in the music-LOUDER-than-speech subset -- the most adverse clips
+# --- in the whole set, labelled here as the mildest condition. The header's
+# --- own admission ("not positively identified") is the accurate part.
+# LOW confidence -- assigned as "the remaining hard clips", not positively
+# identified. Recorded in a different acoustic environment than the normal
+# clips (background correlation 0.65-0.82 vs 0.94-0.99 within-normal).
+speaker_b_31	far?	LOW	background differs from normal
+speaker_b_32	far?	LOW	background differs from normal
+speaker_b_33	far?	LOW	background differs from normal
+speaker_b_34	far?	LOW	background differs from normal
+speaker_b_35	far?	LOW	background differs from normal
+speaker_a_34	far?	LOW	intermediate background
+speaker_a_35	far?	LOW	intermediate background
+speaker_a_37	far?	LOW	intermediate background
+speaker_a_38	far?	LOW	intermediate background
+speaker_a_39	far?	LOW	intermediate background
+speaker_a_40	far?	LOW	intermediate background
+
+# speaker_a_26/27/28 cluster with speaker_a's NORMAL clips (r=0.95-0.99) and are fully
+# voiced -- they look like ordinary close recordings despite their index.
+# Conversely speaker_a_09, speaker_a_14, speaker_b_16, speaker_b_18, speaker_b_22, speaker_b_23 sit in
+# the "normal" index range but are quiet and were missed by both models.
+# Clip index does not reliably indicate condition in this set.
+
+# ------------------------------------------------- CORRECTED (by ear, user)
+# 2026-07-29. Ground truth for the 22 clips in unused/excluded/music/.
+# These lines come LAST on purpose: the parser in make_v7_split.py keeps the
+# last line seen per clip, so these override the inferred blocks above.
+# label "music"      = wake word spoken over music
+# label "music-loud" = wake word over music, MUSIC LOUDER THAN THE WAKE WORD
+#                      (still audible to a human listener)
+# The dB SNR of each clip was NOT measured, and vocal-vs-instrumental was NOT
+# assessed -- only the by-ear condition and the louder/not-louder ordering.
+# Canonical copy of this table: real_music_ground_truth.tsv
+speaker_a_29	music	VERIFIED	by ear 2026-07-29
+speaker_a_30	music	VERIFIED	by ear 2026-07-29
+speaker_a_31	music	VERIFIED	by ear 2026-07-29
+speaker_a_32	music	VERIFIED	by ear 2026-07-29
+speaker_a_33	music	VERIFIED	by ear 2026-07-29
+speaker_a_34	music	VERIFIED	by ear 2026-07-29
+speaker_a_35	music	VERIFIED	by ear 2026-07-29
+speaker_a_36	music	VERIFIED	by ear 2026-07-29; was unlabelled in the inferred blocks
+speaker_a_37	music	VERIFIED	by ear 2026-07-29
+speaker_a_38	music	VERIFIED	by ear 2026-07-29
+speaker_a_39	music	VERIFIED	by ear 2026-07-29
+speaker_a_40	music	VERIFIED	by ear 2026-07-29
+speaker_b_31	music	VERIFIED	by ear 2026-07-29
+speaker_b_32	music	VERIFIED	by ear 2026-07-29
+speaker_b_33	music	VERIFIED	by ear 2026-07-29
+speaker_b_34	music-loud	VERIFIED	by ear 2026-07-29; music louder than wake word
+speaker_b_35	music-loud	VERIFIED	by ear 2026-07-29; music louder than wake word
+speaker_b_36	music-loud	VERIFIED	by ear 2026-07-29; music louder than wake word
+speaker_b_37	music-loud	VERIFIED	by ear 2026-07-29; music louder than wake word
+speaker_b_38	music-loud	VERIFIED	by ear 2026-07-29; music louder than wake word
+speaker_b_39	music-loud	VERIFIED	by ear 2026-07-29; music louder than wake word
+speaker_b_40	music-loud	VERIFIED	by ear 2026-07-29; music louder than wake word
+
+# ------------------------------------------------------------- post-mortem
+# Why the "far?" labels were wrong, written down so the same mistake is not
+# repeated. The measurements in this file were real; the taxonomy built on
+# top of them was not.
+#
+# 1. STRUCTURAL: "far" was a RESIDUAL BUCKET BY CONSTRUCTION.
+#    classify_conditions.py labels every clip above --reference-max-index as
+#    exactly one of music/whisper/far, capped at --per-speaker-music 5 and
+#    --per-speaker-whisper 5 (lines 111-112, 157-164). Everything left over
+#    is forced into "far" -- it was never a positive identification, exactly
+#    as the block header admits. speaker_a actually has 12 music clips; a cap of
+#    5 made mislabelling 7 of them unavoidable no matter how good the
+#    statistics were.
+# 2. IGNORED EVIDENCE ALREADY IN THE REPO. labels.tsv, produced by
+#    label_clips.sh (a listen-and-label-BY-EAR tool), already recorded
+#    speaker_a_29-40 and speaker_b_31-35 as "music" -- including every clip this file
+#    later called "far?". The two files were never reconciled. labels.tsv
+#    was also incomplete (speaker_b_36-40 had no rows until 2026-07-29), which
+#    probably made it look less authoritative than it was.
+# 3. THE STATISTIC WORKED; THE TAXONOMY DIDN'T. The energy-floor measure
+#    (floor 0.41-0.53 for speaker_b_36-40) was real signal -- it was ranking
+#    MUSIC LOUDNESS, and those 5 clips are a subset of the verified
+#    louder-than-speech 7. It was read as a music/not-music boundary when it
+#    was actually a music-LEVEL gradient. A statistic that separates cleanly
+#    can still be answering a different question than the one asked.
+# 4. "VERIFY BY EAR" WAS WRITTEN AND THEN NOT ENFORCED. The YAMNet failure
+#    mode was correctly diagnosed (it fails on speech-dominant mixtures) and
+#    the fallback statistic was correctly flagged LOW confidence -- but the
+#    fallback was never checked against a single listened sample before
+#    being written out as labels, and those labels were then consumed by
+#    eval, split and reporting tooling for months. A LOW-confidence label
+#    that nothing blocks on is indistinguishable in practice from a
+#    confident one.
+#
+# Downstream effect of this correction: it changes what make_v7_split.py's
+# cross-reference PRINTS, but NOT the v7 split itself -- make_v7_split.py
+# builds the split purely from eval_results/v6.json scores (categorize(),
+# build_split()); load_conditions() feeds the report section only.

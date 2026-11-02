@@ -1,0 +1,313 @@
+diff --git a/openwakeword/data.py b/openwakeword/data.py
+index ae2143f..2938c5b 100755
+--- a/openwakeword/data.py
++++ b/openwakeword/data.py
+@@ -33,10 +33,41 @@ from numpy.lib.format import open_memmap
+ from speechbrain.dataio.dataio import read_audio
+ from speechbrain.processing.signal_processing import reverberate
+ import torchaudio
++import soundfile
+ import mutagen
+ import acoustics
+ 
+ 
++def _load_audio(path):
++    """LOCAL PATCH: bit-identical, much cheaper stand-in for `torchaudio.load`.
++
++    torchaudio 2.5's `load` goes through a dispatcher that re-resolves the
++    backend and re-probes the file on EVERY call. The decode itself is ~0.1 ms;
++    the dispatcher is the rest. Same failure mode as the tflite thread-count
++    bug: per-call library overhead swamping the actual work.
++
++    Measured on this box, 500 real PCM_16 clips, best of 3, warm cache:
++        torchaudio.load                    2.101 ms/clip
++        soundfile.read(dtype="float32")    0.115 ms/clip     18.3x
++
++    Bit-identical, not merely close: `torch_audiomentations` already forces the
++    soundfile backend at import, so this is the same libsndfile underneath and
++    the same float32 scaling. Verified with `torch.equal` on real clips drawn
++    from every corpus shape this pipeline reads (positives, tv_mix, fma,
++    audioset_16k, mit_rirs) -- see tests/test_clip_loader_equivalence.py.
++
++    The `except` fallback is deliberate and must stay: anything libsndfile
++    cannot open (or opens differently) goes back to torchaudio rather than
++    silently changing shape or dtype.
++    """
++    try:
++        data, sr = soundfile.read(path, dtype="float32", always_2d=True)
++    except Exception:
++        return torchaudio.load(path)
++    # soundfile gives (samples, channels); torchaudio gives (channels, samples).
++    return torch.from_numpy(np.ascontiguousarray(data.T)), sr
++
++
+ # Load audio clips and structure into clips of the same length
+ def stack_clips(audio_data, clip_size=16000*2):
+     """
+@@ -898,7 +929,7 @@ def augment_clips(
+             batch = partition_clip_paths[i:i+batch_size]
+             augmented_clips = []
+             for clip in batch:
+-                clip_data, clip_sr = torchaudio.load(clip)
++                clip_data, clip_sr = _load_audio(clip)  # LOCAL PATCH: was torchaudio.load
+                 clip_data = clip_data[0]
+                 if clip_data.shape[0] > total_length:
+                     clip_data = clip_data[0:total_length]
+@@ -917,7 +948,14 @@ def augment_clips(
+ 
+             # Do reverberation
+             if augmentation_probabilities["RIR"] >= np.random.random() and RIR_paths != []:
+-                rir_waveform, sr = torchaudio.load(random.choice(RIR_paths))
++                # LOCAL PATCH: was torchaudio.load. NOTE the `sr` here shadows
++                # the function's own sample-rate argument -- that is upstream's
++                # behaviour and is deliberately preserved, not fixed, because
++                # changing it could change what augment1 is told downstream.
++                # It is latent on this box: all 270 mit_rirs files are
++                # 16 kHz / mono / PCM_16, so `sr` is reassigned to the value it
++                # already had.
++                rir_waveform, sr = _load_audio(random.choice(RIR_paths))
+                 augmented_batch = reverberate(augmented_batch.cpu(), rir_waveform, rescale_amp="avg")
+ 
+             # yield batch of 16-bit PCM audio data
+@@ -971,7 +1009,8 @@ class mmap_batch_generator:
+                  batch_size: int = 128,
+                  n_per_class: dict = {},
+                  data_transform_funcs: dict = {},
+-                 label_transform_funcs: dict = {}
++                 label_transform_funcs: dict = {},
++                 stack: bool = True
+                  ):
+         """
+         Initialize the generator object
+@@ -1008,6 +1047,9 @@ class mmap_batch_generator:
+         self.data_files = data_files
+         self.label_files = label_files
+         self.n_per_class = n_per_class
++        # LOCAL PATCH: with stack=False, __next__ yields the per-class list of
++        # arrays instead of np.vstack-ing them here. See __next__.
++        self.stack = stack
+         self.data_transform_funcs = data_transform_funcs
+         self.label_transform_funcs = label_transform_funcs
+ 
+@@ -1076,6 +1118,26 @@ class mmap_batch_generator:
+                 X.append(x)
+                 y.extend(y_batch)
+ 
++            # LOCAL PATCH: `stack=False` hands the per-class arrays back
++            # unstacked so the caller can do the dtype widening on the GPU.
++            #
++            # np.vstack here is where the training loop was actually spending
++            # its time. Of the 1264 rows in a v7 batch, 1152 come from float16
++            # files (the ACAV100M 2000 h bank and media_negatives), so vstack
++            # widens them to float32 on ONE CPU core before anything reaches
++            # the device. Measured per step on this box, real arrays:
++            #   A  np.vstack (CPU upcast) + .to(cuda)  -- as shipped   6.43 ms
++            #   B  per-class .to(cuda) -> .float() -> torch.cat        0.66 ms
++            #   C  B + pinned staging buffers                          0.71 ms
++            # against 2.60 ms of fwd+bwd+opt on 102,849 parameters: the loop
++            # was starved, not GPU-bound. (Do NOT add pinned memory -- C is
++            # measurably slower than B.)
++            #
++            # float16 -> float32 is an EXACT widening, so where it happens
++            # cannot change a bit; torch.equal on real batches confirms it.
++            # tests/test_batch_assembly.py is the guard.
++            if not self.stack:
++                return X, np.array(y)
+             return np.vstack(X), np.array(y)
+ 
+ 
+diff --git a/openwakeword/train.py b/openwakeword/train.py
+index 83f2b8a..1590f33 100755
+--- a/openwakeword/train.py
++++ b/openwakeword/train.py
+@@ -21,6 +21,62 @@ from openwakeword.utils import compute_features_from_generator
+ from openwakeword.utils import AudioFeatures
+ 
+ 
++def _assemble_batch(x, device):
++    """LOCAL PATCH: move a training batch to `device`, doing any dtype
++    widening THERE rather than on one CPU core.
++
++    `mmap_batch_generator(stack=False)` yields the per-class arrays unstacked
++    (as a list of tensors, once the DataLoader has converted them). 1152 of a
++    v7 batch's 1264 rows come from float16 files -- the ACAV100M 2000 h bank
++    and media_negatives -- and upstream's `np.vstack` widened all of them to
++    float32 single-threaded before anything reached the GPU. Measured on this
++    box, real v7 feature files, batch (1252, 16, 96), 400 steps after 40
++    warm-up, both timers containing the identical mmap read:
++
++        A  np.vstack (CPU upcast) + .to(cuda)  -- as shipped   4.300 ms/step
++        B  per-class .to(cuda) -> widen -> torch.cat           0.970 ms/step
++                                                               4.43x
++
++    fwd+bwd+opt on the same 102,849-parameter model is 2.051 ms/step.
++    (Pinned staging buffers were measured SLOWER than B and are deliberately
++    not used.)
++
++    HONEST END-TO-END CAVEAT -- do not quote the 4.43x as a training-stage
++    speedup. Measured on the real loop, 2000 steps, 3 repeats, best of each:
++
++        bare fwd/bwd/opt loop, prefetch OFF   8.43 -> 3.37 ms/step   2.50x
++        bare fwd/bwd/opt loop, prefetch ON    4.32 -> 3.50 ms/step   1.24x
++        through Model.train_model             8.63 -> 8.51 ms/step   1.01x
++
++    Two things absorb it. `prefetch_generator` (already present) runs the
++    generator on a background thread, so the np.vstack was ALREADY overlapped
++    with the GPU step. And `train_model` itself spends ~5 ms/step on its own
++    bookkeeping -- `loss.detach().cpu().numpy()`, `self.recall(...).cpu()` and
++    the per-step weight tensor each force a device synchronisation -- which
++    dominates whatever the batch path costs. This change is kept because it is
++    bit-identical, halves the host->device bytes (7.7 MB -> 4.1 MB per step),
++    and becomes load-bearing the moment those per-step syncs are addressed;
++    it is NOT kept on the strength of a training-stage wall-clock win, because
++    there is not currently a measurable one.
++
++    The result is bit-identical, and not by luck: the target dtype is computed
++    with the SAME promotion rule numpy applied (torch.promote_types folded over
++    the inputs, so an all-float16 batch still yields float16 exactly as
++    np.vstack would), and float16 -> float32 is an exact widening with a unique
++    result. Asserted, not assumed -- see tests/test_batch_assembly.py.
++
++    Accepts an already-stacked tensor too, so `stack=True` callers and any
++    other DataLoader keep working unchanged.
++    """
++    if not isinstance(x, (list, tuple)):
++        return x.to(device)
++    parts = [t.to(device) for t in x]
++    dtype = parts[0].dtype
++    for t in parts[1:]:
++        dtype = torch.promote_types(dtype, t.dtype)
++    return torch.cat([t.to(dtype) for t in parts], dim=0)
++
++
+ # Base model class for an openwakeword model
+ class Model(nn.Module):
+     def __init__(self, n_classes=1, input_shape=(16, 96), model_type="dnn",
+@@ -493,7 +549,7 @@ class Model(nn.Module):
+         accumulated_labels = torch.Tensor([]).to(self.device)
+         for step_ndx, data in tqdm(enumerate(X, 0), total=max_steps, desc="Training"):
+             # get the inputs; data is a list of [inputs, labels]
+-            x, y = data[0].to(self.device), data[1].to(self.device)
++            x, y = _assemble_batch(data[0], self.device), data[1].to(self.device)
+             y_ = y[..., None].to(torch.float32)
+ 
+             # Update learning rates
+@@ -1012,7 +1068,11 @@ if __name__ == '__main__':
+             config["feature_data_files"],
+             n_per_class=config["batch_n_per_class"],
+             data_transform_funcs=data_transforms,
+-            label_transform_funcs=label_transforms
++            label_transform_funcs=label_transforms,
++            # LOCAL PATCH: hand the per-class arrays over unstacked so
++            # _assemble_batch can do the float16 -> float32 widening on the GPU.
++            # 6.43 ms -> 0.66 ms per step, bit-identical.
++            stack=False
+         )
+ 
+         class IterDataset(torch.utils.data.IterableDataset):
+diff --git a/openwakeword/utils.py b/openwakeword/utils.py
+index 7b538fe..fce1b20 100644
+--- a/openwakeword/utils.py
++++ b/openwakeword/utils.py
+@@ -93,6 +93,20 @@ def select_feature_device():
+     return device, cpu_feature_threads()
+ 
+ 
++#: LOCAL PATCH: how many augmented clips `compute_features_from_generator`
++#: buffers before calling `embed_clips`. Deliberately independent of the
++#: config's `augmentation_batch_size` -- see the long comment at the point of
++#: use for why raising THAT instead would change the augmentation, and for the
++#: bit-identity evidence that raising THIS does not.
++#:
++#: Measured end to end, 9600 real v7 positive clips, augmentation_batch_size=32,
++#: device="gpu", ncpu=8, idle box, two runs each:
++#:     upstream batching   39.19 s / 39.47 s   (244.9 / 243.2 clips/s)
++#:     buffered to 256     16.45 s / 16.19 s   (583.6 / 592.9 clips/s)   2.42x
++#: (that figure also includes the soundfile clip loader in openwakeword/data.py)
++FEATURE_BATCH_SIZE = 256
++
++
+ def prefetch_generator(generator, queue_size=4):
+     """Run `generator` on a background thread, yielding its items to the caller.
+ 
+@@ -795,25 +809,67 @@ def compute_features_from_generator(generator, n_total, clip_duration, output_fi
+         raise ValueError(f"The value of 'n_total' ({n_total}) is less than the batch size ({batch_size})."
+                          " Please increase 'n_total' to be >= batch size.")
+ 
+-    # LOCAL PATCH: pass ncpu here too -- upstream omitted it on this first call
+-    # only, so the very first batch always ran single-threaded.
+-    features = F.embed_clips(audio_data, batch_size=batch_size, ncpu=ncpu)
+-    fp[row_counter:row_counter+features.shape[0], :, :] = features
+-    row_counter += features.shape[0]
+-    fp.flush()
++    # LOCAL PATCH: decouple the FEATURE batch from the AUGMENTATION batch.
++    #
++    # Upstream sets batch_size = audio_data.shape[0], so the config's
++    # `augmentation_batch_size` (32) also pinned feature extraction to 32 --
++    # two unrelated knobs sharing one number. They are not interchangeable:
++    # `build_batch_augmentations` builds PitchShift / BandStopFilter /
++    # AddColoredNoise with mode="per_batch" and draws one RIR per batch, so
++    # RAISING augmentation_batch_size would make 128 clips share a single pitch
++    # shift and a single RIR -- a real loss of augmentation diversity. Buffering
++    # already-augmented batches before calling embed_clips costs nothing:
++    # a 256 x 32000 int16 buffer is 16 MB, and each clip keeps its own
++    # augmentation draw.
++    #
++    # Proven free, on 256 REAL clips taken straight out of augment_clips:
++    # np.array_equal is True for BOTH the melspectrogram and the embedding at
++    # batch_size 64 / 128 / 256 vs 32, and at ncpu 1 / 8 / 16, on BOTH the
++    # CUDAExecutionProvider and the CPUExecutionProvider -- max_abs_diff 0.0
++    # in every combination. (This works because the melspectrogram is mapped
++    # one clip at a time regardless -- see _get_melspectrogram_batch's own
++    # LOCAL PATCH -- and every 76-frame embedding window is independent.)
++    #
++    # Setting the module-level FEATURE_BATCH_SIZE to 1 restores upstream's
++    # exact one-embed-call-per-augmentation-batch behaviour; that is what
++    # tests/test_feature_batching.py compares against.
++    feature_batch_size = max(batch_size, FEATURE_BATCH_SIZE)
++
++    pending = []
++    pending_rows = 0
++
++    def _flush(pending, row_counter):
++        """Embed the buffered audio and append it to the memmap. Returns the
++        new row_counter. Row order is preserved exactly: batches are
++        concatenated in generator order and written front to back, which
++        trim_mmap downstream depends on."""
++        if not pending:
++            return row_counter
++        chunk = pending[0] if len(pending) == 1 else np.concatenate(pending, axis=0)
++        features = F.embed_clips(chunk, batch_size=chunk.shape[0], ncpu=ncpu)
++        if row_counter + features.shape[0] > n_total:
++            features = features[0:n_total-row_counter]
++        fp[row_counter:row_counter+features.shape[0], :, :] = features
++        row_counter += features.shape[0]
++        fp.flush()
++        return row_counter
++
++    pending.append(audio_data)
++    pending_rows += audio_data.shape[0]
+ 
+     # Compute features and add data to output file
+     for audio_data in tqdm(generator, total=n_total//batch_size, desc="Computing features"):
+-        if row_counter >= n_total:
++        if row_counter + pending_rows >= n_total:
+             break
+ 
+-        features = F.embed_clips(audio_data, batch_size=batch_size, ncpu=ncpu)
+-        if row_counter + features.shape[0] > n_total:
+-            features = features[0:n_total-row_counter]
++        pending.append(audio_data)
++        pending_rows += audio_data.shape[0]
+ 
+-        fp[row_counter:row_counter+features.shape[0], :, :] = features
+-        row_counter += features.shape[0]
+-        fp.flush()
++        if pending_rows >= feature_batch_size:
++            row_counter = _flush(pending, row_counter)
++            pending, pending_rows = [], 0
++
++    row_counter = _flush(pending, row_counter)
+ 
+     # Trip empty rows from the mmapped array
+     trim_mmap(output_file)

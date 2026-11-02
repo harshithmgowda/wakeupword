@@ -1,0 +1,43 @@
+diff --git a/openwakeword/train.py b/openwakeword/train.py
+index fd75e10..e0ee1db 100755
+--- a/openwakeword/train.py
++++ b/openwakeword/train.py
+@@ -12,6 +12,7 @@ import scipy
+ import collections
+ import argparse
+ import logging
++import random
+ from tqdm import tqdm
+ import yaml
+ from pathlib import Path
+@@ -835,6 +836,30 @@ if __name__ == '__main__':
+     args = parser.parse_args()
+     config = yaml.load(open(args.training_config, 'r').read(), yaml.Loader)
+ 
++    # Optional seeding. Nothing in this pipeline was seeded: clip generation,
++    # augmentation draws and the training loop all varied run to run, so two
++    # runs of the same config were two samples rather than one result. Set
++    # `seed: <int>` in the training config to pin them.
++    #
++    # DEFAULT IS UNSEEDED, deliberately -- every model this repo has shipped was
++    # trained without a seed, and silently seeding would change what the same
++    # config produces.
++    #
++    # This seeds python, numpy and torch (CPU + all CUDA devices), which covers
++    # augment_clips' numpy draws, torch-audiomentations' torch draws, weight
++    # initialisation and batch sampling. It does NOT by itself guarantee
++    # bit-identical GPU results: cuDNN/cuBLAS kernel selection and atomics can
++    # still vary. See docs/reproducing-v7.md for what was measured.
++    seed = config.get("seed")
++    if seed is not None:
++        seed = int(seed)
++        random.seed(seed)
++        np.random.seed(seed)
++        torch.manual_seed(seed)
++        torch.cuda.manual_seed_all(seed)
++        os.environ.setdefault("PYTHONHASHSEED", str(seed))
++        logging.info(f"Seeded python/numpy/torch with seed={seed}")
++
+     # imports Piper for synthetic sample generation
+     sys.path.insert(0, os.path.abspath(config["piper_sample_generator_path"]))
+     from generate_samples import generate_samples

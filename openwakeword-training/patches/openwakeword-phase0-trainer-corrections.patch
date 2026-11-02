@@ -1,0 +1,207 @@
+diff --git a/openwakeword/train.py b/openwakeword/train.py
+index 1059f0d..83f2b8a 100755
+--- a/openwakeword/train.py
++++ b/openwakeword/train.py
+@@ -147,7 +147,7 @@ class Model(nn.Module):
+         if self.n_classes == 1:
+             # Save ONNX model
+             torch.onnx.export(self.model.to("cpu"), torch.rand(self.input_shape)[None, ], output_path,
+-                              output_names=[class_mapping])
++                              input_names=["input"], output_names=[class_mapping])
+ 
+         elif self.n_classes >= 1:
+             class M(nn.Module):
+@@ -162,7 +162,7 @@ class Model(nn.Module):
+ 
+             # Save ONNX model
+             torch.onnx.export(M(), torch.rand(self.input_shape)[None, ], output_path,
+-                              output_names=[class_mapping])
++                              input_names=["input"], output_names=[class_mapping])
+ 
+     def lr_warmup_cosine_decay(self,
+                                global_step,
+@@ -205,21 +205,39 @@ class Model(nn.Module):
+         averaged_model = copy.deepcopy(models[0])
+         averaged_model_dict = averaged_model.state_dict()
+ 
++        # LOCAL PATCH: average only the floating-point entries. BatchNorm registers
++        # `num_batches_tracked` as an int64 buffer, and `tensor /= len(models)` on an
++        # integer tensor raises "result type Float can't be cast to the desired output
++        # type Long" -- so upstream's averaging *hard-crashes* on any model containing
++        # a BatchNorm layer, which is precisely what a future mel branch wants to use.
++        # Integer buffers are counters, not weights, so keep the value already present
++        # in the deepcopied base model, as torch.optim.swa_utils.AveragedModel does
++        # with buffers. Provably a no-op for the float-only LayerNorm heads shipped
++        # today: every state_dict entry is floating point, so `averageable` is every
++        # key and the arithmetic below is unchanged.
++        averageable = [key for key, value in averaged_model_dict.items() if value.is_floating_point()]
++
+         # Initialize a running total of the weights
+-        for key in averaged_model_dict:
++        for key in averageable:
+             averaged_model_dict[key] *= 0  # set to 0
+ 
+         for model in models:
+             model_dict = model.state_dict()
+-            for key, value in model_dict.items():
+-                averaged_model_dict[key] += value
++            for key in averageable:
++                averaged_model_dict[key] += model_dict[key]
+ 
+-        for key in averaged_model_dict:
++        for key in averageable:
+             averaged_model_dict[key] /= len(models)
+ 
+         # Load the averaged weights into the model
+         averaged_model.load_state_dict(averaged_model_dict)
+ 
++        # LOCAL PATCH: the averaged weights are a model that was never trained as
++        # such, and every caller hands it straight to validation or export. Leave it
++        # in eval mode so BatchNorm uses its (averaged) running statistics rather
++        # than the statistics of whatever validation batch happens to arrive.
++        averaged_model.eval()
++
+         return averaged_model
+ 
+     def _select_best_model(self, false_positive_validate_data, val_set_hrs=11.3, max_fp_per_hour=0.5, min_recall=0.20):
+@@ -354,6 +372,10 @@ class Model(nn.Module):
+         else:
+             combined_model = self.model
+ 
++        # LOCAL PATCH: self.model is left in training mode by train_model, and the
++        # merged model is validated and then exported -- both must be eval.
++        combined_model.eval()
++
+         # Report validation metrics for combined model
+         with torch.no_grad():
+             for batch in X_val:
+@@ -438,8 +460,15 @@ class Model(nn.Module):
+         # Save ONNX model
+         logging.info(f"####\nSaving ONNX mode as '{os.path.join(output_dir, model_name + '.onnx')}'")
+         model_to_save = copy.deepcopy(model)
++        # LOCAL PATCH: name the graph input explicitly. Without input_names torch
++        # derives it from the first traced op, e.g. "onnx::Flatten_0", which changes
++        # the moment the head topology changes -- and onnx2tf *silently ignores* a
++        # nonexistent name passed to -kat/--keep_shape_absolutely_input_names, so the
++        # export would quietly transpose the input axes and produce a model that
++        # never activates. A stable name keeps 05_export_tflite.sh honest.
+         torch.onnx.export(model_to_save.to("cpu"), torch.rand(self.input_shape)[None, ],
+-                          os.path.join(output_dir, model_name + ".onnx"), opset_version=13)
++                          os.path.join(output_dir, model_name + ".onnx"), opset_version=13,
++                          input_names=["input"])
+ 
+         return None
+ 
+@@ -452,6 +481,12 @@ class Model(nn.Module):
+         self.model.to(self.device)
+ 
+         # Train model
++        # LOCAL PATCH: upstream never calls .train()/.eval() anywhere. Harmless for
++        # the shipped LayerNorm heads, silently wrong for anything with BatchNorm or
++        # Dropout -- validation would run on the validation batch's own statistics.
++        # Set it explicitly here, flip to eval for the validation blocks below, and
++        # flip back afterwards.
++        self.model.train()
+         accumulation_steps = 1
+         accumulated_samples = 0
+         accumulated_predictions = torch.Tensor([]).to(self.device)
+@@ -521,6 +556,10 @@ class Model(nn.Module):
+                     accumulated_predictions = torch.Tensor([]).to(self.device)
+                     accumulated_labels = torch.Tensor([]).to(self.device)
+ 
++            # LOCAL PATCH: eval mode for every validation block below.
++            if step_ndx in val_steps and step_ndx > 1:
++                self.model.eval()
++
+             # Run validation and log validation metrics
+             if step_ndx in val_steps and step_ndx > 1 and false_positive_val_data is not None:
+                 # Get false positives per hour with false positive data
+@@ -578,10 +617,71 @@ class Model(nn.Module):
+                     self.best_val_recall = self.history["val_recall"][-1]
+                     self.best_val_accuracy = self.history["val_accuracy"][-1]
+ 
++            # LOCAL PATCH: back to training mode for the next step. Note the
++            # checkpoints appended just above were deep-copied while in eval mode,
++            # which is what average_models() and _select_best_model() then consume.
++            if step_ndx in val_steps and step_ndx > 1:
++                self.model.train()
++
+             if step_ndx == max_steps-1:
+                 break
+ 
+ 
++# LOCAL PATCH: build the per-class label transforms without hardcoding
++# "positive" as the only positive-labelled class.
++#
++# Upstream did:
++#
++#     for key in ["positive"] + list(config["feature_data_files"].keys()) + ["adversarial_negative"]:
++#         if key == "positive":
++#             label_transforms[key] = lambda x: [1 for i in x]
++#         else:
++#             label_transforms[key] = lambda x: [0 for i in x]
++#
++# and only assigned `config["feature_data_files"]["positive"]` *after* that loop, so
++# the loop had no way to recognise a second positive class. Any extra positive class
++# in `feature_data_files` -- e.g. real over-music recordings given their own class
++# key so that their share of each batch is a hyperparameter instead of an accident
++# of corpus size -- was therefore trained as a NEGATIVE, with no error and no
++# warning. Only a silently worse model.
++def make_label_transforms(class_keys, positive_classes=None):
++    """Map each feature-data class key to a label transform (1 = wake word, 0 = not).
++
++    A class is positive if its key is exactly "positive", starts with "positive_",
++    or is named in the training config's optional `positive_classes` list.
++
++    Args:
++        class_keys (iterable): the class keys batches will be built from
++        positive_classes (iterable): extra keys to label positive, from the config
++
++    Returns:
++        dict: {class key: callable mapping a batch of labels to a list of 0/1}
++    """
++    class_keys = list(class_keys)
++    extra_positives = set(positive_classes or [])
++
++    unknown = extra_positives.difference(class_keys)
++    if unknown:
++        logging.warning(f"`positive_classes` names {sorted(unknown)}, which are not among the "
++                        f"feature data classes {sorted(set(class_keys))} -- check for a typo, "
++                        "as an unmatched name has no effect.")
++
++    def is_positive(key):
++        return key == "positive" or key.startswith("positive_") or key in extra_positives
++
++    label_transforms = {}
++    for key in class_keys:
++        if is_positive(key):
++            label_transforms[key] = lambda x: [1 for i in x]
++        else:
++            label_transforms[key] = lambda x: [0 for i in x]
++
++    positives = sorted(k for k in label_transforms if is_positive(k))
++    logging.info(f"Positive-labelled feature classes: {positives}")
++
++    return label_transforms
++
++
+ # Separate function to convert onnx models to tflite format
+ def convert_onnx_to_tflite(onnx_model_path, output_path):
+     """Converts an ONNX version of an openwakeword model to the Tensorflow tflite format."""
+@@ -898,12 +998,10 @@ if __name__ == '__main__':
+ 
+         # Create label transforms as needed for model (currently only supports binary classification models)
+         data_transforms = {key: f for key in config["feature_data_files"].keys()}
+-        label_transforms = {}
+-        for key in ["positive"] + list(config["feature_data_files"].keys()) + ["adversarial_negative"]:
+-            if key == "positive":
+-                label_transforms[key] = lambda x: [1 for i in x]
+-            else:
+-                label_transforms[key] = lambda x: [0 for i in x]
++        label_transforms = make_label_transforms(
++            ["positive"] + list(config["feature_data_files"].keys()) + ["adversarial_negative"],
++            positive_classes=config.get("positive_classes"),
++        )
+ 
+         # Add generated positive and adversarial negative clips to the feature data files dictionary
+         config["feature_data_files"]['positive'] = os.path.join(feature_save_dir, "positive_features_train.npy")

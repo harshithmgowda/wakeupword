@@ -1,0 +1,57 @@
+# Reference list of the training environment's dependencies.
+#
+# ./setup_env.sh IS THE AUTHORITATIVE INSTALLER -- use it, not this file.
+# Two things here cannot be expressed as a flat requirements list:
+#
+#   1. torch must come from the cu121 index (--index-url), installed BEFORE
+#      everything else so the CUDA build wins over any transitive CPU pin.
+#   2. onnxruntime-gpu and onnxruntime provide the same `onnxruntime` module,
+#      so only one may be installed. The GPU wheel is required: with the CPU
+#      wheel, feature extraction silently runs single-threaded and the augment
+#      stage takes ~7.5x longer.
+#
+# This file exists so you can see the pinned set at a glance and for tooling
+# that expects a requirements.txt.
+
+# --- CUDA build, from https://download.pytorch.org/whl/cu121 ---------------
+torch==2.5.0
+torchvision==0.20.0
+torchaudio==2.5.0
+
+# --- pins ------------------------------------------------------------------
+# numpy is held below 2.0: piper-sample-generator, audiomentations 0.33 and
+# speechbrain 0.5.14 all predate the numpy 2 ABI break.
+numpy<2
+# webrtcvad and pronouncing both import pkg_resources, removed in setuptools 81.
+setuptools<81
+
+mutagen==1.47.0
+torchinfo==1.8.0
+torchmetrics==1.2.0
+speechbrain==0.5.14
+audiomentations==0.33.0
+torch-audiomentations==0.11.0
+acoustics==0.2.6
+pronouncing==0.2.0
+deep-phonemizer==0.0.19
+onnx==1.19.1
+onnxruntime-gpu==1.23.2
+
+# --- unpinned ---------------------------------------------------------------
+piper-tts
+piper-phonemize-cross
+webrtcvad
+onnxsim
+scipy
+scikit-learn
+tqdm
+pyyaml
+requests
+soundfile
+
+# openwakeword itself is installed from the local clone with --no-deps:
+#   uv pip install -e ./openwakeword --no-deps
+#
+# tflite export uses a SEPARATE venv (.venv-onnx2tf), created by
+# 05_export_tflite.sh -- onnx2tf's TensorFlow dependency conflicts with the
+# numpy<2 pin above.

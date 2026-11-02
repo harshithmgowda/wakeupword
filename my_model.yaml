@@ -1,0 +1,49 @@
+model_name: hey_nexa
+target_phrase:
+- hey nexa
+custom_negative_phrases:
+- hey alexa
+- alexa
+- hey nexus
+- nexus
+- hey nessa
+- nessa
+- hey next
+- next
+- hey nex
+- hey lex
+- hey siri
+- hey google
+- hello nexa
+- okay nexa
+- nexa
+- exit
+- texas
+- extra
+- annex
+- netflix
+n_samples: 3000
+n_samples_val: 600
+tts_batch_size: 100
+augmentation_batch_size: 32
+piper_sample_generator_path: ./piper-sample-generator
+output_dir: ./my_custom_model
+rir_paths:
+- ./mit_rirs
+background_paths:
+- ./clean_backgrounds
+background_paths_duplication_rate:
+- 1
+false_positive_validation_data_path: ./validation_set_features.npy
+augmentation_rounds: 2
+feature_data_files: {}
+batch_n_per_class:
+  positive: 64
+  adversarial_negative: 64
+model_type: dnn
+layer_size: 32
+steps: 10000
+max_negative_weight: 1000
+target_false_positives_per_hour: 0.2
+target_accuracy: 0.7
+target_recall: 0.5

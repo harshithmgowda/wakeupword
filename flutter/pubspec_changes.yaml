@@ -1,0 +1,36 @@
+# Pubspec additions for Nexaura "Hey Nexa" Wake-Word Detection
+# Add the following lines to your app's pubspec.yaml under dependencies and assets.
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # --- Real-Time Audio Capture ---
+  # Captures raw PCM 16-bit mono 16kHz audio stream directly from the device microphone
+  record: ^5.1.2
+
+  # --- Offline ONNX Runtime Inference ---
+  # Executes melspectrogram.onnx, embedding_model.onnx, and hey_nexa.onnx on-device
+  onnxruntime: ^1.17.1
+
+  # --- Runtime Microphone Permissions ---
+  permission_handler: ^11.3.1
+
+  # --- Local Path & Asset Extraction ---
+  path_provider: ^2.1.3
+
+  # --- (Optional) Background Service ---
+  # If you want Nexa to listen while the app is in the background or screen is off:
+  # flutter_foreground_task: ^8.18.0
+
+flutter:
+  # Ensure the ONNX model files are bundled into the Flutter application APK/IPA
+  assets:
+    - assets/models/melspectrogram.onnx
+    - assets/models/embedding_model.onnx
+    - assets/models/hey_nexa.onnx
+    # If using TFLite runtime instead of ONNX Runtime:
+    # - assets/models/melspectrogram.tflite
+    # - assets/models/embedding_model.tflite
+    # - assets/models/hey_nexa.tflite
+

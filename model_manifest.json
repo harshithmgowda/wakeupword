@@ -1,0 +1,87 @@
+{
+  "manifest_version": "1.0",
+  "target_phrase": "hey nexa",
+  "phonetic_transcription": "N EH1 K S AH0",
+  "model_family": "openWakeWord",
+  "framework": "PyTorch / ONNX Runtime / TensorFlow Lite",
+  "generated_at": "2026-11-02T20:22:00+05:30",
+  "training_hardware": {
+    "gpu": "NVIDIA GeForce RTX 5050 Laptop GPU (8151 MiB VRAM)",
+    "cuda_umd": "13.4",
+    "driver_version": "616.92",
+    "pytorch_version": "2.11.0+cu128",
+    "environment": "WSL2 Ubuntu 22.04 LTS"
+  },
+  "training_parameters": {
+    "total_sequences": 3,
+    "sequence_1_steps": 10000,
+    "sequence_2_steps": 1000,
+    "sequence_3_steps": 1000,
+    "max_negative_weight": 1000,
+    "positive_clips_train": 3000,
+    "positive_clips_test": 600,
+    "negative_clips_train": 3000,
+    "negative_clips_test": 600,
+    "validation_stream_hours": 11.3
+  },
+  "pipeline_stages": [
+    {
+      "stage": 1,
+      "name": "Audio Preprocessor & Mel Spectrogram",
+      "input": "16 kHz 16-bit Mono PCM Audio (1280 samples / 80ms chunks)",
+      "output": "Mel Spectrogram Features [1, 76, 32, 1]",
+      "models": {
+        "onnx": {
+          "path": "models/onnx/melspectrogram.onnx",
+          "size_bytes": 1087958,
+          "sha256": "ba2b0e0f8b7b875369a2c89cb13360ff53bac436f2895cced9f479fa65eb176f"
+        },
+        "tflite": {
+          "path": "models/tflite/melspectrogram.tflite",
+          "size_bytes": 1092516,
+          "sha256": "96fa0adccb6e8cf95cb14465409a1a2898ee4a96a85bb9ed3c7eb0e68bf163e8"
+        }
+      }
+    },
+    {
+      "stage": 2,
+      "name": "Audio Embedding Extractor",
+      "input": "Mel Spectrogram Features [1, 76, 32, 1]",
+      "output": "Acoustic Embedding Vector [1, 96]",
+      "models": {
+        "onnx": {
+          "path": "models/onnx/embedding_model.onnx",
+          "size_bytes": 1326578,
+          "sha256": "70d164290c1d095d1d4ee149bc5e00543250a7316b59f31d056cff7bd3075c1f"
+        },
+        "tflite": {
+          "path": "models/tflite/embedding_model.tflite",
+          "size_bytes": 1330312,
+          "sha256": "c0aea21eb84a4ce90a08c870da41b7a7173b45269e6a3207c71d67c40f3a59d8"
+        }
+      }
+    },
+    {
+      "stage": 3,
+      "name": "Hey Nexa Wake-Word Classifier",
+      "input": "Rolling Embedding Window [1, 16, 96] (16 frames of 96-dim embeddings = ~1.28 seconds)",
+      "output": "Probability Score [1, 1] (0.0 to 1.0)",
+      "recommended_threshold": 0.50,
+      "recommended_cooldown_seconds": 2.5,
+      "recommended_debounce_frames": 2,
+      "models": {
+        "onnx": {
+          "path": "models/onnx/hey_nexa.onnx",
+          "size_bytes": 203183,
+          "sha256": "1dffa5b7367fc164ffbf85b65aabf46cb538779a31e2ced184b346950683c588"
+        },
+        "tflite": {
+          "path": "models/tflite/hey_nexa.tflite",
+          "size_bytes": 207592,
+          "sha256": "dfc5bc9395388b6b1371139b9e9a3fd12efd5883f0c40c32efb75809519530e6"
+        }
+      }
+    }
+  ]
+}
+

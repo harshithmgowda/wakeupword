@@ -1,0 +1,6 @@
+# patches/*.patch are diffs of openwakeword/ files, which use CRLF line endings
+# upstream. The diff content embeds those CRLFs as literal bytes on hunk lines;
+# letting core.autocrlf normalize them to LF on commit corrupts the patch (it
+# then fails to `git apply` against the actual CRLF-native source files). Treat
+# these as opaque binary so git never touches their line endings.
+patches/*.patch -text -diff

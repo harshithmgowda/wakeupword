@@ -1,0 +1,687 @@
+diff --git a/openwakeword/data.py b/openwakeword/data.py
+index 261e62c..ae2143f 100755
+--- a/openwakeword/data.py
++++ b/openwakeword/data.py
+@@ -556,6 +556,183 @@ def apply_reverb(x, rir_files):
+ 
+ 
+ # Alternate data augmentation method using audiomentations library (https://pypi.org/project/audiomentations/)
++def build_background_cache(background_clip_paths, total_length, cache_path, sr=16000,
++                           max_segments_per_file=None):
++    """Pre-decode the background-noise pool into fixed-length segments on disk.
++
++    LOCAL PATCH. `AddBackgroundNoise` re-reads its background audio from the
++    filesystem on every call, and in mode="per_example" that is once per clip in the
++    batch. Measured on this machine, one 32-clip batch spent ~507 ms inside
++    AddBackgroundNoise -- 64 file operations (a metadata probe plus a seek-and-decode
++    per example) scattered across a 7398-file, 3.89 GB pool -- against ~20 ms for
++    every other augmentation in the batch combined. It was the single largest cost in
++    the pipeline once feature extraction was fixed.
++
++    Writing the pool once as one `int16` memmap of `total_length`-sample segments
++    turns each of those reads into an array slice: the same batch drops to ~5.6 ms,
++    a ~90x reduction. Segments are memmapped rather than held in RAM so the cache
++    can exceed memory (the full pool here is ~3.9 GB against 23 GB of RAM that also
++    has to hold a 17 GB feature memmap); the OS page cache keeps the hot parts
++    resident.
++
++    Alongside the segments, a per-source-file index is stored so that sampling can
++    stay faithful to upstream: upstream draws a *file* uniformly and then a random
++    offset inside it, so drawing a file uniformly and then one of its segments
++    preserves that weighting. Sampling segments uniformly instead would silently
++    re-weight the pool toward longer files (a 30 s track yields 15 segments, a 10 s
++    clip only 5).
++
++    Args:
++        background_clip_paths (List[str]): Background audio files. Duplicates are
++            fine and are collapsed here -- per-source weighting is applied at
++            sampling time via `random.choice` over the caller's list, exactly as
++            upstream does.
++        total_length (int): Segment length in samples; must match the `total_length`
++            the clips are augmented at.
++        cache_path (str): Output .npy path. A companion `<cache_path>.index.npz` is
++            written next to it.
++        sr (int): Expected sample rate of the background files.
++        max_segments_per_file (int): Optional cap on segments taken per file.
++
++    Returns:
++        None
++    """
++    unique_paths = sorted({str(Path(os.path.abspath(p))) for p in background_clip_paths})
++    logging.info(f"Building background-noise cache from {len(unique_paths)} unique files "
++                 f"at {total_length} samples/segment -> {cache_path}")
++
++    # First pass: count segments per file so the memmap can be sized exactly.
++    starts, counts, kept = [], [], []
++    running = 0
++    for p in tqdm(unique_paths, desc="Scanning background files"):
++        try:
++            info = torchaudio.info(p)
++        except Exception as e:
++            logging.warning(f"Skipping unreadable background file {p}: {e}")
++            continue
++        if info.sample_rate != sr:
++            logging.warning(f"Skipping background file with sample rate {info.sample_rate} "
++                            f"(expected {sr}): {p}")
++            continue
++        n = int(info.num_frames)//total_length
++        if max_segments_per_file:
++            n = min(n, max_segments_per_file)
++        if n < 1:
++            continue
++        kept.append(p)
++        starts.append(running)
++        counts.append(n)
++        running += n
++
++    if running == 0:
++        raise ValueError("No usable background files found while building the background cache "
++                         f"(need at least {total_length} samples at {sr} Hz).")
++
++    fp = open_memmap(cache_path, mode="w+", dtype=np.int16, shape=(running, total_length))
++    for p, start, count in tqdm(list(zip(kept, starts, counts)), desc="Caching background segments"):
++        # normalize=False keeps PCM_16 sources as exact int16, so the cache holds the
++        # same sample values the file-reading path would decode. Round-tripping
++        # through float and back would perturb every sample by up to half an LSB.
++        data, _ = torchaudio.load(p, normalize=False)
++        if data.dtype != torch.int16:
++            data, _ = torchaudio.load(p)
++            data = (data*32768.0).clamp(-32768, 32767).to(torch.int16)
++        data = data[0].numpy()
++        for k in range(count):
++            fp[start + k] = data[k*total_length:(k + 1)*total_length]
++    fp.flush()
++    del fp
++
++    np.savez(cache_path + ".index.npz",
++             paths=np.array(kept),
++             starts=np.array(starts, dtype=np.int64),
++             counts=np.array(counts, dtype=np.int64),
++             total_length=np.array([total_length], dtype=np.int64))
++    logging.info(f"Background cache built: {running} segments "
++                 f"({running*total_length*2/1e9:.2f} GB) from {len(kept)} files")
++
++
++def load_background_cache(cache_path, total_length):
++    """Load a cache written by `build_background_cache`, validating its geometry."""
++    index_path = cache_path + ".index.npz"
++    if not (os.path.exists(cache_path) and os.path.exists(index_path)):
++        return None, None
++    idx = np.load(index_path, allow_pickle=False)
++    cached_length = int(idx["total_length"][0])
++    if cached_length != total_length:
++        # Silently reusing a cache cut at a different length would mix clip
++        # geometries, so make it loud rather than subtly wrong.
++        raise ValueError(
++            f"Background cache {cache_path} holds {cached_length}-sample segments but "
++            f"total_length is {total_length}. Delete it to have it rebuilt."
++        )
++    segments = np.load(cache_path, mmap_mode="r")
++    path_index = {p: (int(s), int(c))
++                  for p, s, c in zip(idx["paths"].tolist(), idx["starts"], idx["counts"])}
++    return segments, path_index
++
++
++class CachedAddBackgroundNoise(torch_audiomentations.AddBackgroundNoise):
++    """`AddBackgroundNoise` that reads its background audio from a memmapped cache.
++
++    LOCAL PATCH. Only `random_background` is overridden, so every part of the
++    augmentation that affects the *result* -- the SNR draw, the RMS normalisation,
++    the mixing in `apply_transform` -- is inherited from upstream unchanged.
++
++    Two deliberate differences from upstream, neither of which changes the
++    distribution being sampled:
++
++    - The window inside a source file is chosen from that file's fixed segment
++      boundaries rather than an arbitrary sample offset. Both are "a random
++      `total_length` window from this file"; only the granularity differs.
++    - Segment amplitude is scaled by 1/32768 to undo the int16 storage. Upstream's
++      `rms_normalize` divides any positive scale factor straight back out, so this
++      cannot shift the result.
++
++    A file is still drawn with `random.choice(self.background_paths)` -- the caller's
++    list, including any duplicates from `background_paths_duplication_rate` -- so
++    per-source weighting is identical to upstream.
++    """
++
++    def __init__(self, *args, segments=None, path_index=None, **kwargs):
++        super().__init__(*args, **kwargs)
++        if segments is None or path_index is None:
++            raise ValueError("CachedAddBackgroundNoise requires segments and path_index")
++        self._segments = segments
++        self._path_index = path_index
++        self._missing_warned = False
++        missing = {str(p) for p in self.background_paths} - set(path_index)
++        if missing:
++            logging.warning(
++                f"{len(missing)} of {len(self.background_paths)} background paths are absent "
++                "from the cache (unreadable or shorter than total_length when it was built); "
++                "those draws fall back to reading from disk."
++            )
++        self._missing = missing
++
++    def random_background(self, audio, target_num_samples):
++        # Fall back to upstream for anything the cache cannot serve, so a stale or
++        # partial cache degrades in speed rather than in correctness.
++        if target_num_samples > self._segments.shape[1]:
++            return super().random_background(audio, target_num_samples)
++
++        background_path = random.choice(self.background_paths)
++        key = str(background_path)
++        if key in self._missing:
++            return super().random_background(audio, target_num_samples)
++
++        start, count = self._path_index[key]
++        # Don't consume randomness when there is nothing to choose between. Upstream's
++        # single-segment case (source file exactly target_num_samples long) takes a
++        # branch that draws no second random number, so skipping it here keeps the RNG
++        # stream aligned with upstream's for that case instead of shifting every
++        # subsequent draw.
++        seg_ndx = 0 if count == 1 else random.randrange(count)
++        segment = self._segments[start + seg_ndx][:target_num_samples]
++        piece = torch.from_numpy(np.asarray(segment, dtype=np.float32)/32768.0)[None, :]
++        return audio.rms_normalize(audio.rms_normalize(piece))
++
++
+ def augment_clips(
+         clip_paths: List[str],
+         total_length: int,
+@@ -579,6 +756,7 @@ def augment_clips(
+         noisy_clip_pattern: str = "",
+         noisy_background_min_snr_db: float = 10.0,
+         noisy_background_max_snr_db: float = 25.0,
++        background_cache_path: str = "",
+         ):
+     """
+     Applies audio augmentations to the specified audio clips, returning a generator that applies
+@@ -629,6 +807,12 @@ def augment_clips(
+                                   exist.
+         noisy_background_min_snr_db (float): The minimum SNR (dB) for clips matching "noisy_clip_pattern".
+         noisy_background_max_snr_db (float): The maximum SNR (dB) for clips matching "noisy_clip_pattern".
++        background_cache_path (str): Optional path to a background-segment cache (see
++                                  `build_background_cache`). When set, background noise is drawn
++                                  from that memmap instead of being re-read from the source files
++                                  on every call, which is ~90x cheaper per batch in
++                                  mode="per_example". The cache is built on first use if absent.
++                                  Defaults to "", which keeps the upstream file-reading path.
+ 
+     Returns:
+         ndarray: A batch of augmented audio clips of size (batch_size, total_length)
+@@ -645,6 +829,17 @@ def augment_clips(
+         ),
+     ])
+ 
++    # LOCAL PATCH: resolve the background cache once, before any transform is built,
++    # so all partitions share one memmap. Building it here (rather than requiring a
++    # separate preprocessing step) keeps `augment_clips` self-contained; it is a
++    # one-time cost amortised over every call in the run.
++    bg_segments, bg_path_index = None, None
++    if background_cache_path and background_clip_paths != []:
++        bg_segments, bg_path_index = load_background_cache(background_cache_path, total_length)
++        if bg_segments is None:
++            build_background_cache(background_clip_paths, total_length, background_cache_path, sr=sr)
++            bg_segments, bg_path_index = load_background_cache(background_cache_path, total_length)
++
+     # Augmentations that can be done as a batch. Built by a function so that a second,
+     # milder-background version can be built for the "already noisy" clips (see
+     # noisy_clip_pattern) without duplicating the transform list.
+@@ -665,12 +860,18 @@ def augment_clips(
+             ),
+         ]
+         if background_clip_paths != []:
+-            transforms.append(torch_audiomentations.AddBackgroundNoise(
++            bg_cls = torch_audiomentations.AddBackgroundNoise
++            bg_extra = {}
++            if bg_segments is not None:
++                bg_cls = CachedAddBackgroundNoise
++                bg_extra = {"segments": bg_segments, "path_index": bg_path_index}
++            transforms.append(bg_cls(
+                 p=augmentation_probabilities["AddBackgroundNoise"],
+                 background_paths=background_clip_paths,
+                 min_snr_in_db=min_snr_db,
+                 max_snr_in_db=max_snr_db,
+-                mode=background_mode
++                mode=background_mode,
++                **bg_extra
+             ))
+         transforms.append(torch_audiomentations.Gain(max_gain_in_db=0, p=augmentation_probabilities["Gain"]))
+         return torch_audiomentations.Compose(transforms)
+diff --git a/openwakeword/train.py b/openwakeword/train.py
+index 6b4ff30..1059f0d 100755
+--- a/openwakeword/train.py
++++ b/openwakeword/train.py
+@@ -777,6 +777,7 @@ if __name__ == '__main__':
+         "noisy_clip_pattern": config.get("noisy_clip_pattern", ""),
+         "noisy_background_min_snr_db": config.get("noisy_background_min_snr_db", 10.0),
+         "noisy_background_max_snr_db": config.get("noisy_background_max_snr_db", 25.0),
++        "background_cache_path": config.get("background_cache_path", ""),
+     }
+     if config.get("augmentation_probabilities"):
+         aug_kwargs["augmentation_probabilities"] = config["augmentation_probabilities"]
+@@ -813,6 +814,25 @@ if __name__ == '__main__':
+                 n_cpus = 1
+             else:
+                 n_cpus = n_cpus//2
++
++            # LOCAL PATCH: choose the feature-extraction device from what onnxruntime
++            # can actually do, not from torch.cuda.is_available().
++            #
++            # The upstream arguments were:
++            #     device="gpu" if torch.cuda.is_available() else "cpu",
++            #     ncpu=n_cpus if not torch.cuda.is_available() else 1
++            # which assumes "torch sees CUDA" implies "onnxruntime will use the GPU".
++            # Those are independent: with a CPU-only onnxruntime wheel the request for
++            # CUDAExecutionProvider only warns and falls back to CPU, and because torch
++            # *did* see CUDA, ncpu was pinned to 1. Net effect on this 24-core machine:
++            # every feature was computed single-threaded on the CPU, which is why the
++            # augment stage took 2 h 48 m of a 3 h 03 m run at a ~1-2% GPU duty cycle.
++            #
++            # select_feature_device() probes onnxruntime instead and returns a usable
++            # thread count for either device; compute_features_from_generator then
++            # re-picks it if the session it gets is not the one it asked for.
++            feature_device, feature_ncpu = openwakeword.utils.select_feature_device()
++            logging.info(f"Feature extraction: device={feature_device}, ncpu={feature_ncpu}")
+             # LOCAL PATCH: n_total multiplied by augmentation_rounds. The four
+             # *_clips lists above are already `glob(...)*config["augmentation_rounds"]`,
+             # so each generator actually yields augmentation_rounds*N clips. Upstream
+@@ -832,29 +852,29 @@ if __name__ == '__main__':
+                                             n_total=len(os.listdir(positive_train_output_dir))*aug_rounds,
+                                             clip_duration=config["total_length"],
+                                             output_file=os.path.join(feature_save_dir, "positive_features_train.npy"),
+-                                            device="gpu" if torch.cuda.is_available() else "cpu",
+-                                            ncpu=n_cpus if not torch.cuda.is_available() else 1)
++                                            device=feature_device,
++                                            ncpu=feature_ncpu)
+ 
+             compute_features_from_generator(negative_clips_train_generator,
+                                             n_total=len(os.listdir(negative_train_output_dir))*aug_rounds,
+                                             clip_duration=config["total_length"],
+                                             output_file=os.path.join(feature_save_dir, "negative_features_train.npy"),
+-                                            device="gpu" if torch.cuda.is_available() else "cpu",
+-                                            ncpu=n_cpus if not torch.cuda.is_available() else 1)
++                                            device=feature_device,
++                                            ncpu=feature_ncpu)
+ 
+             compute_features_from_generator(positive_clips_test_generator,
+                                             n_total=len(os.listdir(positive_test_output_dir))*aug_rounds,
+                                             clip_duration=config["total_length"],
+                                             output_file=os.path.join(feature_save_dir, "positive_features_test.npy"),
+-                                            device="gpu" if torch.cuda.is_available() else "cpu",
+-                                            ncpu=n_cpus if not torch.cuda.is_available() else 1)
++                                            device=feature_device,
++                                            ncpu=feature_ncpu)
+ 
+             compute_features_from_generator(negative_clips_test_generator,
+                                             n_total=len(os.listdir(negative_test_output_dir))*aug_rounds,
+                                             clip_duration=config["total_length"],
+                                             output_file=os.path.join(feature_save_dir, "negative_features_test.npy"),
+-                                            device="gpu" if torch.cuda.is_available() else "cpu",
+-                                            ncpu=n_cpus if not torch.cuda.is_available() else 1)
++                                            device=feature_device,
++                                            ncpu=feature_ncpu)
+         else:
+             logging.warning("Openwakeword features already exist, skipping data augmentation and feature generation")
+ 
+@@ -920,6 +940,17 @@ if __name__ == '__main__':
+         dl_kwargs = {"batch_size": None, "num_workers": n_workers}
+         if n_workers > 0:
+             dl_kwargs["prefetch_factor"] = 16
++        # LOCAL PATCH: with num_workers=0 the batch generator runs inline in the
++        # training loop, so the GPU waits on it. Measured per step: 3.84 ms building
++        # the batch (mmap reads, warm cache) against 1.52 ms of fwd+bwd+opt on this
++        # 102,849-parameter model plus 0.53 ms to copy it over -- a ~26% GPU duty
++        # cycle. One background *thread* overlaps them without reintroducing the
++        # multi-worker deadlock this patch series fixed: a thread shares the single
++        # generator instead of forking a duplicate of it, so batches are still
++        # produced exactly once, in order. Skipped when workers > 0 so the
++        # OWW_DATALOADER_WORKERS escape hatch keeps upstream behaviour.
++        if n_workers == 0:
++            batch_generator = openwakeword.utils.prefetch_generator(batch_generator, queue_size=8)
+         X_train = torch.utils.data.DataLoader(IterDataset(batch_generator), **dl_kwargs)
+ 
+         X_val_fp = np.load(config["false_positive_validation_data_path"])
+@@ -933,21 +964,22 @@ if __name__ == '__main__':
+             )[:-1].transpose(0, 2, 1)
+         )
+         X_val_fp_labels = np.zeros(X_val_fp.shape[0]).astype(np.float32)
+-        X_val_fp = torch.utils.data.DataLoader(
+-            torch.utils.data.TensorDataset(torch.from_numpy(X_val_fp), torch.from_numpy(X_val_fp_labels)),
+-            batch_size=len(X_val_fp_labels)
++        # LOCAL PATCH: see TensorBatches -- a DataLoader with batch_size == len(dataset)
++        # spent 8.35 s per iteration collating this 481k-row set one row at a time, and
++        # it is re-iterated at every validation step (20 per sequence x 3 sequences).
++        X_val_fp = openwakeword.utils.TensorBatches(
++            torch.from_numpy(X_val_fp), torch.from_numpy(X_val_fp_labels),
++            device=oww.device
+         )
+ 
+         X_val_pos = np.load(os.path.join(feature_save_dir, "positive_features_test.npy"))
+         X_val_neg = np.load(os.path.join(feature_save_dir, "negative_features_test.npy"))
+         labels = np.hstack((np.ones(X_val_pos.shape[0]), np.zeros(X_val_neg.shape[0]))).astype(np.float32)
+ 
+-        X_val = torch.utils.data.DataLoader(
+-            torch.utils.data.TensorDataset(
+-                torch.from_numpy(np.vstack((X_val_pos, X_val_neg))),
+-                torch.from_numpy(labels)
+-                ),
+-            batch_size=len(labels)
++        X_val = openwakeword.utils.TensorBatches(
++            torch.from_numpy(np.vstack((X_val_pos, X_val_neg))),
++            torch.from_numpy(labels),
++            device=oww.device
+         )
+ 
+         # Run auto training
+diff --git a/openwakeword/utils.py b/openwakeword/utils.py
+index 5f64e03..7b538fe 100644
+--- a/openwakeword/utils.py
++++ b/openwakeword/utils.py
+@@ -28,6 +28,166 @@ from typing import Union, List, Callable, Deque
+ import requests
+ 
+ 
++# LOCAL PATCH: helpers for choosing where feature extraction runs, and for
++# overlapping a producer generator with its consumer. Both exist because the
++# feature-extraction stage was the dominant cost of the whole training pipeline
++# (2 h 48 m of a 3 h 03 m run) while the GPU sat at a ~1-2% duty cycle.
++def onnx_gpu_available():
++    """True if onnxruntime advertises a CUDA execution provider.
++
++    This is deliberately NOT `torch.cuda.is_available()`. The two are independent:
++    a CPU-only `onnxruntime` wheel reports no CUDA provider no matter what torch
++    sees, and asking such a build for "CUDAExecutionProvider" only produces a
++    warning and a silent fall back to CPU. Deciding thread counts from torch's view
++    of CUDA is what pinned feature extraction to a single core on this machine.
++
++    Note this is necessary but NOT sufficient: onnxruntime-gpu ships the CUDA
++    provider as a separate shared library that fails to load unless cuBLAS/cuDNN
++    are already resident in the process (here they arrive via the nvidia/* wheels
++    that torch depends on, so importing torch first is what makes it work). Callers
++    must therefore check what an actual session reports -- see
++    `compute_features_from_generator`, which re-picks its thread count if the
++    provider it asked for is not the one it got.
++    """
++    try:
++        import onnxruntime as ort
++    except ImportError:
++        return False
++    return "CUDAExecutionProvider" in ort.get_available_providers()
++
++
++def cpu_feature_threads(max_threads=None):
++    """Thread count to use when features are computed on the CPU.
++
++    Default 8 rather than `os.cpu_count()`: measured on this 24-core machine, one
++    32-clip batch takes 520 ms at 1 thread and 90 ms at 8, then stays flat (91 ms
++    at 16, 91 ms at 24). So 8 captures essentially all of the available gain and
++    leaves cores for the augmentation stage feeding it; under CPU contention the
++    higher counts actively regressed. Override with OWW_FEATURE_THREADS.
++    """
++    if max_threads is None:
++        max_threads = int(os.environ.get("OWW_FEATURE_THREADS", 8))
++    return max(1, min(max_threads, os.cpu_count() or 1))
++
++
++def select_feature_device():
++    """Pick the (device, ncpu) pair for computing openwakeword features.
++
++    `ncpu` is meaningful on both devices. Since melspectrogram.onnx has to be called
++    one clip at a time (see `_get_melspectrogram_batch`), the ThreadPool is what
++    hides per-call latency even on GPU: a 32-clip batch takes 32.5 ms with 1 thread
++    but 16.3 ms with 8.
++
++    Measured per 32-clip batch, all numerically equivalent (<= 8.2e-07 relative to
++    the all-CPU reference, which is what every model in this repo was trained on):
++
++        all CPU, 1 thread  (the old behaviour)   520 ms
++        all CPU, 8 threads                        90 ms
++        GPU, 8 threads                            16 ms
++
++    Force the choice with OWW_FEATURE_DEVICE=cpu|gpu.
++    """
++    device = os.environ.get("OWW_FEATURE_DEVICE", "").strip().lower()
++    if device not in ("cpu", "gpu"):
++        device = "gpu" if onnx_gpu_available() else "cpu"
++    return device, cpu_feature_threads()
++
++
++def prefetch_generator(generator, queue_size=4):
++    """Run `generator` on a background thread, yielding its items to the caller.
++
++    Used to overlap `augment_clips` with feature extraction, which are otherwise
++    strictly sequential inside `compute_features_from_generator` -- one batch is
++    augmented, then embedded, then the next is augmented. The two halves stress
++    different resources (the augmentation is dominated by background-noise file
++    reads, the consumer by onnxruntime inference) and both release the GIL, so a
++    single worker thread genuinely overlaps them.
++
++    A thread rather than a process on purpose: the augmentation generator holds
++    CUDA tensors and unpicklable transform objects, and one worker means the
++    module-level RNGs in `audiomentations` are still touched by exactly one
++    thread at a time. Set OWW_PREFETCH=0 to disable.
++    """
++    import queue
++    import threading
++
++    if os.environ.get("OWW_PREFETCH", "1") == "0":
++        yield from generator
++        return
++
++    q = queue.Queue(maxsize=max(1, queue_size))
++    done = object()
++
++    def _worker():
++        try:
++            for item in generator:
++                q.put(item)
++        except BaseException as e:  # forwarded to the consumer thread below
++            q.put(e)
++        else:
++            q.put(done)
++
++    thread = threading.Thread(target=_worker, name="oww-prefetch", daemon=True)
++    thread.start()
++
++    while True:
++        item = q.get()
++        if item is done:
++            return
++        if isinstance(item, BaseException):
++            raise item
++        yield item
++
++
++class TensorBatches:
++    """Iterate contiguous (x, y) slices of two fixed tensors.
++
++    A drop-in replacement for
++        DataLoader(TensorDataset(x, y), batch_size=len(y))
++    which is how upstream fed the false-positive validation set. That construction
++    is pathological: with batch_size == len(dataset) the default fetcher calls
++    __getitem__ once per row and then default_collate-stacks the results, so the
++    481,329-row / 2.96 GB false-positive set cost 8.35 s to produce a single batch
++    -- and it was rebuilt from scratch at every validation step (20 steps per
++    training sequence x 3 sequences = 60 times per run, ~9 min of a ~15 min
++    training stage). Slicing a contiguous tensor instead is a view: ~0 s.
++
++    Passing `device` also moves the data there once, at construction, so the
++    per-validation host->device copy (a further 1.30 s for 2.96 GB) is paid once
++    rather than 60 times. Consumers that call `.to(device)` on the yielded tensors
++    are unaffected -- `.to()` on a tensor already on the target device is a no-op.
++    Falls back to host memory if the device allocation fails, since the point is to
++    be faster, not to trade a slow run for an OOM.
++
++    Default batch_size is the whole tensor, matching the upstream call exactly.
++    """
++
++    def __init__(self, x, y, batch_size=None, device=None):
++        if device is not None and str(device) != "cpu":
++            try:
++                x, y = x.to(device), y.to(device)
++            except RuntimeError as e:  # includes torch.cuda.OutOfMemoryError
++                logging.warning(
++                    f"Could not hold validation data on {device} ({e.__class__.__name__}); "
++                    "keeping it in host memory and copying per validation step."
++                )
++                # torch is imported lazily: this module is also imported by the
++                # inference runtime, which depends only on onnx/tflite.
++                import torch
++                if torch.cuda.is_available():
++                    torch.cuda.empty_cache()
++        self.x = x
++        self.y = y
++        self.batch_size = int(batch_size) if batch_size else int(y.shape[0])
++
++    def __iter__(self):
++        for i in range(0, self.y.shape[0], self.batch_size):
++            yield self.x[i:i + self.batch_size], self.y[i:i + self.batch_size]
++
++    def __len__(self):
++        return (self.y.shape[0] + self.batch_size - 1)//self.batch_size
++
++
+ # Base class for computing audio features using Google's speech_embedding
+ # model (https://tfhub.dev/google/speech_embedding/1)
+ class AudioFeatures():
+@@ -80,16 +240,32 @@ class AudioFeatures():
+             sessionOptions.inter_op_num_threads = ncpu
+             sessionOptions.intra_op_num_threads = ncpu
+ 
++            # LOCAL PATCH: pin the CUDA provider to strict fp32.
++            #
++            # cuBLAS/cuDNN enable TF32 by default on Ampere and newer (this machine is
++            # an Ada RTX 4090). TF32 keeps only ~10 mantissa bits, and while the
++            # melspectrogram model is unaffected (max abs delta 3.6e-4 on values of
++            # magnitude ~6.7), the error compounds through the embedding model: its
++            # output drifts ~6.9e-4 relative to the CPU provider, which moved trained
++            # wake-word scores by up to 0.11 and flipped 2 of 128 detections at
++            # threshold 0.5 on real clips. Features are training *data* here, and the
++            # deployed model runs on CPU tflite, so that drift is train/serve skew for
++            # no benefit: use_tf32=0 brings agreement to ~8e-7 relative (plain fp32
++            # rounding) at no measurable cost (264.5 ms vs 262.4 ms per 128 clips).
++            if device == "gpu":
++                providers = [("CUDAExecutionProvider", {"use_tf32": "0"})]
++            else:
++                providers = ["CPUExecutionProvider"]
++
+             # Melspectrogram model
+             self.melspec_model = ort.InferenceSession(melspec_model_path, sess_options=sessionOptions,
+-                                                      providers=["CUDAExecutionProvider"] if device == "gpu" else ["CPUExecutionProvider"])
++                                                      providers=providers)
+             self.onnx_execution_provider = self.melspec_model.get_providers()[0]
+             self.melspec_model_predict = lambda x: self.melspec_model.run(None, {'input': x})
+ 
+             # Audio embedding model
+             self.embedding_model = ort.InferenceSession(embedding_model_path, sess_options=sessionOptions,
+-                                                        providers=["CUDAExecutionProvider"] if device == "gpu"
+-                                                        else ["CPUExecutionProvider"])
++                                                        providers=providers)
+             self.embedding_model_predict = lambda x: self.embedding_model.run(None, {'input_1': x})[0].squeeze()
+ 
+         elif inference_framework == "tflite":
+@@ -261,10 +437,26 @@ class AudioFeatures():
+                     all N input audio examples
+         """
+ 
+-        # Prepare ThreadPool object, if needed for multithreading
+-        pool = None
+-        if "CPU" in self.onnx_execution_provider:
+-            pool = ThreadPool(processes=ncpu)
++        # LOCAL PATCH: melspectrogram.onnx must be fed ONE clip per call.
++        #
++        # The model's ONNX output dims are named ('time', 1, <dim>, 32) -- it was
++        # authored for batch_size=1, and handing it a stacked batch silently returns
++        # different numbers rather than failing. Measured on the CPU provider alone
++        # (no GPU involved): for a fixed clip, the model's output differs between
++        # batch=1 and batch>=2 by max 4.02 / mean 2.41 on values of magnitude ~42,
++        # and identically for batch 2, 4 and 8 -- so it is "batch=1 vs batch>1", not
++        # a batch-size effect.
++        #
++        # Upstream took the batched path whenever the execution provider was CUDA,
++        # so device="gpu" computed *different* melspectrograms from device="cpu",
++        # which maps over the batch one clip at a time. Downstream that showed up as
++        # a 3.3% mean difference in embeddings and shifted trained wake-word scores
++        # by up to 0.11. Every model trained in this repo so far used the CPU path
++        # (the installed onnxruntime had no CUDA provider), so the CPU behaviour is
++        # the reference and the fix is to make the GPU path match it: always map per
++        # clip. The ThreadPool is now used on GPU too, where it hides per-call launch
++        # latency (32-clip batch: 32.5 ms at 1 thread vs 16.3 ms at 8).
++        pool = ThreadPool(processes=max(1, ncpu))
+ 
+         # Make batches
+         n_frames = int(np.ceil(x.shape[1]/160-3))
+@@ -273,19 +465,14 @@ class AudioFeatures():
+         for i in range(0, max(batch_size, x.shape[0]), batch_size):
+             batch = x[i:i+batch_size]
+ 
+-            if "CUDA" in self.onnx_execution_provider:
+-                result = self._get_melspectrogram(batch)
+-
+-            elif pool:
+-                chunksize = batch.shape[0]//ncpu if batch.shape[0] >= ncpu else 1
+-                result = np.array(pool.map(self._get_melspectrogram,
+-                                           batch, chunksize=chunksize))
++            chunksize = batch.shape[0]//ncpu if batch.shape[0] >= ncpu else 1
++            result = np.array(pool.map(self._get_melspectrogram,
++                                       batch, chunksize=chunksize))
+ 
+             melspecs[i:i+batch_size, :, :] = result.squeeze()
+ 
+         # Cleanup ThreadPool
+-        if pool:
+-            pool.close()
++        pool.close()
+ 
+         return melspecs
+ 
+@@ -562,9 +749,38 @@ def compute_features_from_generator(generator, n_total, clip_duration, output_fi
+     # Function specific imports
+     from openwakeword.data import trim_mmap
+ 
+-    # Create audio features object
++    # Create audio features object.
++    #
++    # LOCAL PATCH: `ncpu` is deliberately NOT forwarded to the constructor, which
++    # would set onnxruntime's intra_op/inter_op thread counts. The parallelism that
++    # pays here is the ThreadPool inside _get_melspectrogram_batch/_get_embeddings_batch
++    # (passed per call below); letting onnxruntime *also* spawn N threads per pool
++    # worker just oversubscribes the cores. Measured on a 32-clip batch: pool=8 with
++    # 1 onnx thread is 111 ms, pool=8 with 8 onnx threads is 122 ms, and 8 onnx
++    # threads with pool=1 is 409 ms -- i.e. the pool is doing the real work.
+     F = AudioFeatures(device=device)
+ 
++    # LOCAL PATCH: trust the session, not the request. onnxruntime lists
++    # CUDAExecutionProvider as available whenever the GPU wheel is installed, but
++    # the provider is a separate .so that silently fails to load if cuBLAS/cuDNN
++    # aren't already resident in the process -- it logs an error and falls back to
++    # CPU. Landing on CPU with a thread count chosen for GPU is exactly the
++    # single-core pathology this patch exists to remove, so re-pick it and say so.
++    if device == "gpu" and "CUDA" not in F.onnx_execution_provider:
++        ncpu = cpu_feature_threads()
++        logging.warning(
++            "Requested GPU feature extraction but onnxruntime created a "
++            f"'{F.onnx_execution_provider}' session instead (the CUDA provider "
++            "failed to load -- check that cuBLAS/cuDNN are importable, e.g. that "
++            f"torch is imported first). Falling back to CPU with ncpu={ncpu}."
++        )
++    logging.info(f"Computing features with provider={F.onnx_execution_provider}, ncpu={ncpu}")
++
++    # LOCAL PATCH: overlap augmentation with feature extraction. Without this the
++    # loop below alternates between an I/O-bound producer and a compute-bound
++    # consumer, leaving whichever one is idle completely unused.
++    generator = prefetch_generator(generator)
++
+     # Determine the output shape and create output file
+     n_feature_cols = F.get_embedding_shape(clip_duration/16000)
+     output_shape = (n_total, n_feature_cols[0], n_feature_cols[1])
+@@ -579,7 +795,9 @@ def compute_features_from_generator(generator, n_total, clip_duration, output_fi
+         raise ValueError(f"The value of 'n_total' ({n_total}) is less than the batch size ({batch_size})."
+                          " Please increase 'n_total' to be >= batch size.")
+ 
+-    features = F.embed_clips(audio_data, batch_size=batch_size)
++    # LOCAL PATCH: pass ncpu here too -- upstream omitted it on this first call
++    # only, so the very first batch always ran single-threaded.
++    features = F.embed_clips(audio_data, batch_size=batch_size, ncpu=ncpu)
+     fp[row_counter:row_counter+features.shape[0], :, :] = features
+     row_counter += features.shape[0]
+     fp.flush()

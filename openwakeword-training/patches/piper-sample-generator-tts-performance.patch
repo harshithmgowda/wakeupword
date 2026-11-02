@@ -1,0 +1,174 @@
+diff --git a/generate_samples.py b/generate_samples.py
+index bb582bc..e047482 100755
+--- a/generate_samples.py
++++ b/generate_samples.py
+@@ -38,6 +38,7 @@ def generate_samples(
+     verbose: bool = False,
+     auto_reduce_batch_size: bool = False,
+     min_phoneme_count: Optional[int] = None,
++    cuda_memory_fraction: Optional[float] = 0.9,
+     **kwargs,
+ ) -> None:
+     """
+@@ -62,6 +63,12 @@ def generate_samples(
+                                        if CUDA OOM errors are detected, and try to resume generation.
+         min_phoneme_count (int): If set, ensure this number of phonemes is always sent to the model.
+                                  Clip audio to extract original phrase.
++        cuda_memory_fraction (float): LOCAL PATCH. Cap CUDA allocations at this fraction of
++                                 device memory so an oversized batch raises OutOfMemoryError
++                                 (which auto_reduce_batch_size can then handle) instead of
++                                 being satisfied out of host memory by the WSL2 driver's
++                                 sysmem-fallback policy -- measured 448x slower on one batch.
++                                 Pass None to disable. See the block that applies it.
+ 
+     Returns:
+         None
+@@ -81,6 +88,41 @@ def generate_samples(
+         torch_model.cuda()
+         _LOGGER.debug("CUDA available, using GPU")
+ 
++        # LOCAL PATCH: make the allocator FAIL instead of silently spilling to
++        # host memory.
++        #
++        # THE BUG THIS FIXES. Three identical batch-100 calls, same code, same
++        # batch size, measured on this box (RTX 4090, 24 GB, WSL2):
++        #   audio_T=147456  dt=  0.891 s  peak_reserved=16.35 GB  num_ooms=0
++        #   audio_T=157952  dt=  2.330 s  peak_reserved=24.83 GB  num_ooms=0
++        #   audio_T=198144  dt=398.892 s  peak_reserved=33.10 GB  num_ooms=0
++        # 33.10 GB reserved on a 24 GB card with num_ooms=0. The NVIDIA WSL2
++        # driver's sysmem-fallback policy satisfies the cudaMalloc out of host
++        # memory rather than failing, so `except torch.cuda.OutOfMemoryError`
++        # below can never fire and the run silently thrashes across PCIe --
++        # a measured 448x on one batch. It is intermittent at a fixed batch
++        # size because VITS' duration predictor is stochastic
++        # (noise_scale_w=0.8), so y_lengths.max() -- which sizes the decoder
++        # tensor for the WHOLE batch -- varies per batch. That is exactly the
++        # "wedged at batch 100, fine at batch 25" symptom in docs/HANDOFF.md.
++        #
++        # WHAT THIS CHANGES. With a fraction set, an over-large batch raises
++        # OutOfMemoryError, auto_reduce_batch_size retries at a smaller batch,
++        # and the run continues in seconds instead of stalling for minutes.
++        # NOTE HONESTLY: a reduced batch DOES change generated audio, because
++        # audio_float_to_int16 normalises by np.max(np.abs(audio)) over the
++        # whole (batch, 1, T) array -- batch composition sets every clip's
++        # gain. That is the behaviour auto_reduce_batch_size already asks for
++        # by name; this patch only makes it reachable. Pass
++        # cuda_memory_fraction=None to restore the old (thrashing) behaviour.
++        if cuda_memory_fraction is not None:
++            torch.cuda.set_per_process_memory_fraction(float(cuda_memory_fraction))
++            _LOGGER.debug(
++                "Capped CUDA allocations at %.2f of device memory so that "
++                "oversized batches raise OutOfMemoryError instead of spilling "
++                "to host memory", cuda_memory_fraction,
++            )
++
+     output_dir = Path(output_dir)
+     output_dir.mkdir(parents=True, exist_ok=True)
+ 
+@@ -174,12 +216,13 @@ def generate_samples(
+                 oom_error = True
+                 counter = 1
+                 while oom_error is True:
++                    effective_batch = max(1, batch_size // counter)
+                     try:
+                         audio, phoneme_samples = generate_audio(
+                             torch_model,
+-                            speaker_1[0 : batch_size // counter],
+-                            speaker_2[0 : batch_size // counter],
+-                            phoneme_ids_by_batch[0 : batch_size // counter],
++                            speaker_1[0:effective_batch],
++                            speaker_2[0:effective_batch],
++                            phoneme_ids_by_batch[0:effective_batch],
+                             slerp_weight,
+                             noise_scale,
+                             noise_scale_w,
+@@ -188,9 +231,28 @@ def generate_samples(
+                         )
+                         oom_error = False
+                     except torch.cuda.OutOfMemoryError:
++                        if effective_batch == 1:
++                            raise
+                         torch.cuda.empty_cache()
+                         gc.collect()
+                         counter += 1  # reduce batch size to avoid OOM errors
++
++                # LOCAL PATCH: truncate the per-item bookkeeping to what was
++                # actually generated. Upstream reduced the batch here but left
++                # clip_indexes_by_batch at full length, so the very next loop
++                # (`for i, clip_phoneme_index in enumerate(clip_indexes_by_batch)`)
++                # indexed phoneme_samples past its end:
++                #   IndexError: index 33 is out of bounds for dimension 0 with
++                #   size 33
++                # i.e. auto_reduce_batch_size=True -- which gen_tts_speech.py
++                # passes -- has never actually been a working safety net; the
++                # first OOM retry crashed the run. Reproduced by forcing the
++                # path with set_per_process_memory_fraction(0.20).
++                #
++                # The dropped texts are not lost: `texts` is an it.cycle, so
++                # they come back around on a later batch.
++                if len(clip_indexes_by_batch) > audio.shape[0]:
++                    clip_indexes_by_batch = clip_indexes_by_batch[: audio.shape[0]]
+             else:
+                 audio, phoneme_samples = generate_audio(
+                     torch_model,
+@@ -225,9 +287,23 @@ def generate_samples(
+ 
+             audio_int16 = audio_float_to_int16(audio)
+             for audio_idx in range(audio_int16.shape[0]):
+-                # Trim any silenced audio
+-                audio_data = np.trim_zeros(audio_int16[audio_idx].flatten())
+-                
++                # LOCAL PATCH: a dead `audio_data = np.trim_zeros(...)` used to
++                # sit here. Its result was never read -- the very next
++                # statement reassigns audio_data from the SAME untrimmed
++                # source array -- and it was 60-77% of all TTS wall clock.
++                #
++                # np.trim_zeros on numpy 1.26 is a Python-level element loop.
++                # Every clip in a batch is right-padded to y_lengths.max(), so
++                # it walked T_max(batch) - own_length zeros one Python int at a
++                # time. Measured on this box, real batch shapes:
++                #   batch=1   T_max= 40000    9.107 ms/clip
++                #   batch=25  T_max= 60000   27.154 ms/clip
++                #   batch=100 T_max=198144  151.300 ms/clip  (15.13 s/batch)
++                #
++                # Deleting it is provably output-preserving by inspection; the
++                # A/B with torch.manual_seed(0) fixed confirms byte-identical
++                # WAVs.
++                #
+                 # Use webrtcvad to trim any remaining silence from the clips
+                 audio_data = remove_silence(audio_int16[audio_idx].flatten())[
+                     None,
+@@ -266,17 +342,29 @@ def remove_silence(
+     sample_rate: int = 16000,
+     min_start: int = 2000,
+ ) -> np.ndarray:
+-    """Uses webrtc voice activity detection to remove silence from the clips"""
++    """Uses webrtc voice activity detection to remove silence from the clips
++
++    LOCAL PATCH: assemble the output with np.concatenate instead of building a
++    Python list one int at a time (`x_new.extend(x[i:i+step].tolist())` per
++    30 ms frame). The vad.is_speech calls, their argument bytes and the
++    accept/reject decisions are all unchanged -- only the concatenation of the
++    accepted frames is vectorised -- so the result is bit-identical.
++
++    Measured on this box, 3 repeats over real generated clips, array_equal
++    True for every clip:
++      60 x positives_es   (mean 1.12 s): 0.660 -> 0.108 ms/clip  (6.13x)
++      60 x tv_mix_speech  (mean 4.39 s): 3.002 -> 0.470 ms/clip  (6.38x)
++    """
+     vad = webrtcvad.Vad(0)
+     if x.dtype in (np.float32, np.float64):
+         x = (x * 32767).astype(np.int16)
+-    x_new = x[0:min_start].tolist()
+     step_size = int(sample_rate * frame_duration)
++    parts = [x[0:min_start]]
+     for i in range(min_start, x.shape[0] - step_size, step_size):
+         vad_res = vad.is_speech(x[i : i + step_size].tobytes(), sample_rate)
+         if vad_res:
+-            x_new.extend(x[i : i + step_size].tolist())
+-    return np.array(x_new).astype(np.int16)
++            parts.append(x[i : i + step_size])
++    return np.concatenate(parts).astype(np.int16, copy=False)
+ 
+ 
+ def generate_audio(

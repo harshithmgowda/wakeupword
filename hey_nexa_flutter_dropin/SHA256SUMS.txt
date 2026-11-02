@@ -1,0 +1,10 @@
+# SHA-256 Checksums for openWakeWord "Hey Nexa" Inference Models
+# Generated: 2026-11-02
+
+70d164290c1d095d1d4ee149bc5e00543250a7316b59f31d056cff7bd3075c1f  models/onnx/embedding_model.onnx
+1dffa5b7367fc164ffbf85b65aabf46cb538779a31e2ced184b346950683c588  models/onnx/hey_nexa.onnx
+ba2b0e0f8b7b875369a2c89cb13360ff53bac436f2895cced9f479fa65eb176f  models/onnx/melspectrogram.onnx
+c0aea21eb84a4ce90a08c870da41b7a7173b45269e6a3207c71d67c40f3a59d8  models/tflite/embedding_model.tflite
+dfc5bc9395388b6b1371139b9e9a3fd12efd5883f0c40c32efb75809519530e6  models/tflite/hey_nexa.tflite
+96fa0adccb6e8cf95cb14465409a1a2898ee4a96a85bb9ed3c7eb0e68bf163e8  models/tflite/melspectrogram.tflite
+

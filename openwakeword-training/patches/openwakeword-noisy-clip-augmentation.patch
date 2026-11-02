@@ -1,0 +1,188 @@
+diff --git a/openwakeword/data.py b/openwakeword/data.py
+index fc9114d..261e62c 100755
+--- a/openwakeword/data.py
++++ b/openwakeword/data.py
+@@ -14,6 +14,7 @@
+ 
+ # imports
+ from multiprocessing.pool import ThreadPool
++import fnmatch
+ import os
+ import re
+ import logging
+@@ -575,6 +576,9 @@ def augment_clips(
+         background_min_snr_db: float = -10.0,
+         background_max_snr_db: float = 15.0,
+         background_mode: str = "per_batch",
++        noisy_clip_pattern: str = "",
++        noisy_background_min_snr_db: float = 10.0,
++        noisy_background_max_snr_db: float = 25.0,
+         ):
+     """
+     Applies audio augmentations to the specified audio clips, returning a generator that applies
+@@ -610,6 +614,21 @@ def augment_clips(
+         background_clip_paths (List[str]) = The paths to background audio files to mix with the input files
+         RIR_paths (List[str]) = The paths to room impulse response functions (RIRs) to convolve with the input files,
+                                 producing a version of the input clip with different acoustic characteristics.
++        background_min_snr_db (float): The minimum SNR (dB) used when mixing background audio into a clip.
++        background_max_snr_db (float): The maximum SNR (dB) used when mixing background audio into a clip.
++        background_mode (str): The torch_audiomentations mode for AddBackgroundNoise ("per_batch" or "per_example").
++        noisy_clip_pattern (str): A glob pattern (fnmatch, matched against the *file name* of each entry in
++                                  clip_paths, not the full path) selecting clips that are ALREADY noisy — e.g.
++                                  real recordings captured over music. Those clips are augmented with the
++                                  milder "noisy_background_*_snr_db" range instead of the normal one, so a
++                                  second background mixed on top does not bury the utterance past recovery.
++                                  Matching clips are processed in their own batches, so the yielded batches
++                                  are no longer in clip_paths order when this is set (the outputs are an
++                                  unordered feature pool, so order does not matter). Defaults to "", which
++                                  matches no clips and leaves behaviour exactly as if this argument did not
++                                  exist.
++        noisy_background_min_snr_db (float): The minimum SNR (dB) for clips matching "noisy_clip_pattern".
++        noisy_background_max_snr_db (float): The maximum SNR (dB) for clips matching "noisy_clip_pattern".
+ 
+     Returns:
+         ndarray: A batch of augmented audio clips of size (batch_size, total_length)
+@@ -626,9 +645,11 @@ def augment_clips(
+         ),
+     ])
+ 
+-    # Augmentations that can be done as a batch
+-    if background_clip_paths != []:
+-        augment2 = torch_audiomentations.Compose([
++    # Augmentations that can be done as a batch. Built by a function so that a second,
++    # milder-background version can be built for the "already noisy" clips (see
++    # noisy_clip_pattern) without duplicating the transform list.
++    def build_batch_augmentations(min_snr_db, max_snr_db):
++        transforms = [
+             torch_audiomentations.PitchShift(
+                 min_transpose_semitones=-3,
+                 max_transpose_semitones=3,
+@@ -642,62 +663,64 @@ def augment_clips(
+                 min_f_decay=-1, max_f_decay=2, p=augmentation_probabilities["AddColoredNoise"],
+                 mode="per_batch"
+             ),
+-            torch_audiomentations.AddBackgroundNoise(
++        ]
++        if background_clip_paths != []:
++            transforms.append(torch_audiomentations.AddBackgroundNoise(
+                 p=augmentation_probabilities["AddBackgroundNoise"],
+                 background_paths=background_clip_paths,
+-                min_snr_in_db=background_min_snr_db,
+-                max_snr_in_db=background_max_snr_db,
++                min_snr_in_db=min_snr_db,
++                max_snr_in_db=max_snr_db,
+                 mode=background_mode
+-            ),
+-            torch_audiomentations.Gain(max_gain_in_db=0, p=augmentation_probabilities["Gain"]),
+-        ])
++            ))
++        transforms.append(torch_audiomentations.Gain(max_gain_in_db=0, p=augmentation_probabilities["Gain"]))
++        return torch_audiomentations.Compose(transforms)
++
++    # Split the clips into a "normal" and an "already noisy" partition. torch_audiomentations
++    # applies a transform across the whole batch tensor, so an exemption for individual
++    # examples inside one batch isn't expressible; instead each partition is batched and
++    # augmented separately, with its own background SNR range. With the default empty
++    # pattern the noisy partition is empty and every clip takes exactly the original path.
++    if noisy_clip_pattern:
++        normal_clip_paths = [p for p in clip_paths if not fnmatch.fnmatch(os.path.basename(p), noisy_clip_pattern)]
++        noisy_clip_paths = [p for p in clip_paths if fnmatch.fnmatch(os.path.basename(p), noisy_clip_pattern)]
+     else:
+-        augment2 = torch_audiomentations.Compose([
+-            torch_audiomentations.PitchShift(
+-                min_transpose_semitones=-3,
+-                max_transpose_semitones=3,
+-                p=augmentation_probabilities["PitchShift"],
+-                sample_rate=16000,
+-                mode="per_batch"
+-            ),
+-            torch_audiomentations.BandStopFilter(p=augmentation_probabilities["BandStopFilter"], mode="per_batch"),
+-            torch_audiomentations.AddColoredNoise(
+-                min_snr_in_db=10, max_snr_in_db=30,
+-                min_f_decay=-1, max_f_decay=2, p=augmentation_probabilities["AddColoredNoise"],
+-                mode="per_batch"
+-            ),
+-            torch_audiomentations.Gain(max_gain_in_db=0, p=augmentation_probabilities["Gain"]),
+-        ])
++        normal_clip_paths, noisy_clip_paths = list(clip_paths), []
++
++    partitions = [(normal_clip_paths, build_batch_augmentations(background_min_snr_db, background_max_snr_db))]
++    if noisy_clip_paths:
++        partitions.append((noisy_clip_paths,
++                           build_batch_augmentations(noisy_background_min_snr_db, noisy_background_max_snr_db)))
+ 
+     # Iterate through all clips and augment them
+-    for i in range(0, len(clip_paths), batch_size):
+-        batch = clip_paths[i:i+batch_size]
+-        augmented_clips = []
+-        for clip in batch:
+-            clip_data, clip_sr = torchaudio.load(clip)
+-            clip_data = clip_data[0]
+-            if clip_data.shape[0] > total_length:
+-                clip_data = clip_data[0:total_length]
+-
+-            if clip_sr != sr:
+-                raise ValueError("Error! Clip does not have the correct sample rate!")
+-
+-            clip_data = create_fixed_size_clip(clip_data, total_length, clip_sr)
+-
+-            # Do first pass augmentations
+-            augmented_clips.append(torch.from_numpy(augment1(samples=clip_data, sample_rate=sr)))
+-
+-        # Do second pass augmentations
+-        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+-        augmented_batch = augment2(samples=torch.vstack(augmented_clips).unsqueeze(dim=1).to(device), sample_rate=sr).squeeze(axis=1)
+-
+-        # Do reverberation
+-        if augmentation_probabilities["RIR"] >= np.random.random() and RIR_paths != []:
+-            rir_waveform, sr = torchaudio.load(random.choice(RIR_paths))
+-            augmented_batch = reverberate(augmented_batch.cpu(), rir_waveform, rescale_amp="avg")
+-
+-        # yield batch of 16-bit PCM audio data
+-        yield (augmented_batch.cpu().numpy()*32767).astype(np.int16)
++    for partition_clip_paths, augment2 in partitions:
++        for i in range(0, len(partition_clip_paths), batch_size):
++            batch = partition_clip_paths[i:i+batch_size]
++            augmented_clips = []
++            for clip in batch:
++                clip_data, clip_sr = torchaudio.load(clip)
++                clip_data = clip_data[0]
++                if clip_data.shape[0] > total_length:
++                    clip_data = clip_data[0:total_length]
++
++                if clip_sr != sr:
++                    raise ValueError("Error! Clip does not have the correct sample rate!")
++
++                clip_data = create_fixed_size_clip(clip_data, total_length, clip_sr)
++
++                # Do first pass augmentations
++                augmented_clips.append(torch.from_numpy(augment1(samples=clip_data, sample_rate=sr)))
++
++            # Do second pass augmentations
++            device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
++            augmented_batch = augment2(samples=torch.vstack(augmented_clips).unsqueeze(dim=1).to(device), sample_rate=sr).squeeze(axis=1)
++
++            # Do reverberation
++            if augmentation_probabilities["RIR"] >= np.random.random() and RIR_paths != []:
++                rir_waveform, sr = torchaudio.load(random.choice(RIR_paths))
++                augmented_batch = reverberate(augmented_batch.cpu(), rir_waveform, rescale_amp="avg")
++
++            # yield batch of 16-bit PCM audio data
++            yield (augmented_batch.cpu().numpy()*32767).astype(np.int16)
+ 
+ 
+ def create_fixed_size_clip(x, n_samples, sr=16000, start=None, end_jitter=.200):
+diff --git a/openwakeword/train.py b/openwakeword/train.py
+index cb8295e..6b4ff30 100755
+--- a/openwakeword/train.py
++++ b/openwakeword/train.py
+@@ -774,6 +774,9 @@ if __name__ == '__main__':
+         "background_min_snr_db": config.get("background_min_snr_db", -10.0),
+         "background_max_snr_db": config.get("background_max_snr_db", 15.0),
+         "background_mode": config.get("background_mode", "per_batch"),
++        "noisy_clip_pattern": config.get("noisy_clip_pattern", ""),
++        "noisy_background_min_snr_db": config.get("noisy_background_min_snr_db", 10.0),
++        "noisy_background_max_snr_db": config.get("noisy_background_max_snr_db", 25.0),
+     }
+     if config.get("augmentation_probabilities"):
+         aug_kwargs["augmentation_probabilities"] = config["augmentation_probabilities"]

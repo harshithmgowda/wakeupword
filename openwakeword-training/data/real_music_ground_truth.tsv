@@ -1,0 +1,64 @@
+# GROUND TRUTH -- the 22 real wake-word-over-music recordings
+# Directory: ~/openwakeword-train-data/unused/excluded/music/
+#            (speaker_a_29..speaker_a_40, speaker_b_31..speaker_b_40)
+#
+# SOURCE: the repo owner LISTENED to all 22 clips on 2026-07-29. These labels
+# are by-ear ground truth and are AUTHORITATIVE. They SUPERSEDE the inferred
+# labels in conditions.txt, which were produced statistically, WITHOUT
+# listening, and are WRONG for 11 of these 22 clips. See the correction
+# banner and post-mortem at the top and bottom of conditions.txt.
+#
+# WHAT WAS VERIFIED BY EAR
+#   * ALL 22 clips are the wake word spoken over MUSIC. There is no
+#     far-field-only clip among them; conditions.txt's "far?" block does not
+#     describe any clip in this set.
+#   * speaker_b_34..speaker_b_40 (7 clips, inclusive) are the ADVERSE subset: the
+#     music is LOUDER than the wake word. The wake word is still audible to
+#     a human listener in all 7.
+#   * The other 15 clips are the wake word over music at less adverse levels.
+#   * speaker_a_36, which conditions.txt left unlabelled entirely, is music.
+#
+# COLUMNS
+#   clip         file name in the directory above
+#   condition    always "music" -- wake word spoken with music playing
+#   loud_subset  yes = music louder than the wake word (speaker_b_34..speaker_b_40)
+#   verified_by  who listened
+#   verified_on  date of the listening pass
+#
+# NOT VERIFIED BY THIS PASS (open questions; do not assert these anywhere)
+#   * The actual speech-to-music SNR in dB of any clip. Only the ordinal
+#     judgement "music louder than the wake word" was made, and only for the
+#     7 clips marked loud_subset=yes.
+#   * Whether the interfering music is vocal or instrumental. This matters:
+#     vocal music is competing speech, a different masker from instrumental.
+#   * How many distinct recording sessions / music beds / levels the 22 span.
+#     The 7 loud clips are consecutive indices from one speaker and are most
+#     likely ONE session at ONE level with ONE track. Treat them as one
+#     condition observed 7 times, not as 7 independent samples of "loud
+#     music" -- see eval_results/operating_point.md section 1a.
+#
+# CONSUMERS: v7_music_split.tsv (14 train / 8 heldout over exactly these 22),
+# eval_music.py real_music part, pick_threshold.py, make_v7_split.py.
+clip	condition	loud_subset	verified_by	verified_on
+speaker_a_29.wav	music	no	user (by ear)	2026-07-29
+speaker_a_30.wav	music	no	user (by ear)	2026-07-29
+speaker_a_31.wav	music	no	user (by ear)	2026-07-29
+speaker_a_32.wav	music	no	user (by ear)	2026-07-29
+speaker_a_33.wav	music	no	user (by ear)	2026-07-29
+speaker_a_34.wav	music	no	user (by ear)	2026-07-29
+speaker_a_35.wav	music	no	user (by ear)	2026-07-29
+speaker_a_36.wav	music	no	user (by ear)	2026-07-29
+speaker_a_37.wav	music	no	user (by ear)	2026-07-29
+speaker_a_38.wav	music	no	user (by ear)	2026-07-29
+speaker_a_39.wav	music	no	user (by ear)	2026-07-29
+speaker_a_40.wav	music	no	user (by ear)	2026-07-29
+speaker_b_31.wav	music	no	user (by ear)	2026-07-29
+speaker_b_32.wav	music	no	user (by ear)	2026-07-29
+speaker_b_33.wav	music	no	user (by ear)	2026-07-29
+speaker_b_34.wav	music	yes	user (by ear)	2026-07-29
+speaker_b_35.wav	music	yes	user (by ear)	2026-07-29
+speaker_b_36.wav	music	yes	user (by ear)	2026-07-29
+speaker_b_37.wav	music	yes	user (by ear)	2026-07-29
+speaker_b_38.wav	music	yes	user (by ear)	2026-07-29
+speaker_b_39.wav	music	yes	user (by ear)	2026-07-29
+speaker_b_40.wav	music	yes	user (by ear)	2026-07-29
